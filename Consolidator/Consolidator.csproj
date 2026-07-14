@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+    <PropertyGroup>
+        <Authors>Akari</Authors>
+        <AssemblyName>Consolidator</AssemblyName>
+        <Version>1.2.4.0</Version>
+        <Description>Automatically consolidates gil from your submarine alts onto a single character via trade.</Description>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <TargetFramework>net10.0-windows</TargetFramework>
+        <Platforms>x64</Platforms>
+        <Nullable>enable</Nullable>
+        <DebugSymbols>true</DebugSymbols>
+        <DebugType>full</DebugType>
+        <LangVersion>latest</LangVersion>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <OutputType>Library</OutputType>
+        <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+        <RootNamespace>Consolidator</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Content Include="Consolidator.json">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="ECommons" Version="3.2.0.9" />
+    </ItemGroup>
+
+    <PropertyGroup>
+        <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    </PropertyGroup>
+</Project>

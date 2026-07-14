@@ -1,0 +1,19 @@
+{
+  "Author": "Akari",
+  "Name": "Consolidator",
+  "InternalName": "Consolidator",
+  "AssemblyVersion": "1.2.4.0",
+  "TestingAssemblyVersion": "1.2.4.0",
+  "Description": "Consolidates gil from your alt characters onto a single main. Logs into each character, travels to a chosen world via Lifestream, walks to your main with vnavmesh, trades over all gil above a floor you set, then returns to the FC. Requires AutoRetainer, Lifestream and vnavmesh; the receiving character needs Dropbox running to auto-accept the trades.",
+  "ApplicableVersion": "any",
+  "DalamudApiLevel": 15,
+  "Tags": [
+    "gil",
+    "submarine",
+    "automation",
+    "autoretainer",
+    "lifestream"
+  ],
+  "Punchline": "Sweep gil from every alt onto one character.",
+  "RepoUrl": "https://github.com/dexcss/Consolidator"
+}

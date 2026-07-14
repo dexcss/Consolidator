@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # The Dalamud SDK resolves game assemblies from a local Dalamud install, which
+      # a clean runner doesn't have. Fetch the dev distribution and point the SDK at it.
+      - name: Fetch Dalamud
+        run: |
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile latest.zip
+          Expand-Archive -Path latest.zip -DestinationPath "$env:APPDATA\XIVLauncher\addon\Hooks\dev"
+        shell: pwsh
+
+      - name: Restore
+        run: dotnet restore Consolidator/Consolidator.csproj
+
+      - name: Build
+        run: dotnet build Consolidator/Consolidator.csproj -c Release --no-restore
+
+      # The Dalamud SDK's output directory has moved between versions, so locate the
+      # built DLL rather than hardcoding a path that may not exist.
+      - name: Package
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path Consolidator/bin -Recurse -Filter Consolidator.dll | Select-Object -First 1
+          if (-not $dll) { throw "Consolidator.dll not found under Consolidator/bin" }
+
+          $dir = $dll.Directory.FullName
+          Write-Host "Packaging from $dir"
+
+          $json = Join-Path $dir 'Consolidator.json'
+          if (-not (Test-Path $json)) { Copy-Item Consolidator/Consolidator.json $json }
+
+          Compress-Archive -Path "$dir/*" -DestinationPath Consolidator.zip -Force
+          Copy-Item $json ./Consolidator.json -Force
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Consolidator.zip
+            Consolidator.json
