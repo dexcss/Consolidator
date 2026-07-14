@@ -153,6 +153,40 @@ public class Configuration : IPluginConfiguration
     // Don't trust a cached figure older than this. 0 = no age limit.
     public int CachedGilMaxAgeHours = 24;
 
+    // Keep retrying a trade that isn't going through, rather than giving up after a
+    // few attempts.
+    //
+    // The case this exists for: several accounts all feeding the same main. The
+    // receiving character is frequently mid-trade with someone else, so a rejection
+    // isn't a failure at all — it's just contention, and waiting is the right answer.
+    //
+    // It's a *time* budget rather than an attempt count, because attempts are cheap
+    // and meaningless here; what matters is how long we're willing to sit on one
+    // character before deciding something is genuinely wrong. Unbounded retrying
+    // would let a real problem (main logged out, inventory full) stall the queue
+    // forever without ever saying so.
+    public bool PatientRetry;
+    public int PatientRetryMinutes = 15;
+
+    // Wait this long between attempts while being patient. Hammering the trade
+    // request every 1.5s for fifteen minutes is neither necessary nor polite.
+    // Jittered at use, so two accounts retrying on the same cadence can't stay
+    // locked in step with each other indefinitely.
+    public int PatientRetryDelaySeconds = 20;
+
+    // When a character exhausts its patience budget, put them at the back of the
+    // queue rather than skipping them outright.
+    //
+    // This is what stops contention silently eating characters. A busy receiver is a
+    // transient condition — by the time we've worked through everyone else they're
+    // very likely free, so a character that couldn't get a trade in should be retried
+    // later rather than written off.
+    public bool RequeueOnBusy = true;
+
+    // How many times one character may be sent to the back of the queue before we
+    // accept they're genuinely not going to work.
+    public int MaxRequeues = 2;
+
     // Walk inside the house after teleporting, rather than logging out on the plot.
     // Off by default: entering means walking to the door and interacting, which is
     // more that can go wrong than simply teleporting and logging out.

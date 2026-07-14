@@ -53,6 +53,12 @@ public class Sweeper
     public SweepState State { get; private set; } = SweepState.Idle;
     public bool Running { get; private set; }
     public bool Paused { get; private set; }
+
+    // Seconds left on the current patient-retry backoff, or 0 if we're not waiting.
+    public int WaitingSeconds =>
+        patientWaitUntil > DateTime.Now
+            ? (int)(patientWaitUntil - DateTime.Now).TotalSeconds
+            : 0;
     public int Index { get; private set; }
     public List<CharEntry> Queue { get; private set; } = new();
     public List<SweepLogLine> Log { get; } = new();
@@ -60,8 +66,66 @@ public class Sweeper
     private DateTime deadline = DateTime.MaxValue;
     private long gilToSend;          // total still owed on this character
     private int thisTrade;           // gil in the current trade window
-    private int tradeFailures;       // consecutive trades where gil didn't move
+    private int tradeFailures;       // consecutive trades where nothing moved
     private const int MaxTradeFailures = 3;
+
+    // Patient-retry state: when we first started waiting on this character, and when
+    // the current backoff expires.
+    private DateTime patientSince = DateTime.MinValue;
+    private DateTime patientWaitUntil = DateTime.MinValue;
+
+    private readonly Random jitterRng = new();
+    private DateTime receiverLostAt = DateTime.MinValue;
+
+    // How many times each character has been sent to the back of the queue, so a
+    // permanently-unreachable receiver can't cause an endless loop.
+    private readonly Dictionary<string, int> requeues = new();
+
+    // Move the current character to the end of the queue. Returns false once they've
+    // been requeued too many times, in which case the caller should fail them.
+    private bool Requeue()
+    {
+        var c = Queue[Index];
+        var key = c.Full;
+
+        requeues.TryGetValue(key, out var count);
+        if (count >= Math.Max(0, cfg.MaxRequeues)) return false;
+
+        requeues[key] = count + 1;
+
+        // Pull them out and put them on the end. Index stays where it is, which now
+        // points at whoever was next — so there's no need to advance it.
+        Queue.RemoveAt(Index);
+        Queue.Add(c);
+
+        AddLog(c.Full,
+            $"Receiver stayed busy. Moving to the back of the queue " +
+            $"({count + 1} of {cfg.MaxRequeues}) — will retry after the others.",
+            true);
+
+        ResetPerCharacter();
+        Goto(SweepState.Relog, cfg.LoginTimeout);
+        return true;
+    }
+
+    private void ResetPerCharacter()
+    {
+        gilToSend = 0;
+        thisTrade = 0;
+        charSent = 0;
+        moveIssued = false;
+        doorMoveIssued = false;
+        usingLifestreamPath = false;
+        logoutSent = false;
+        tradeFailures = 0;
+        settleStart = DateTime.MinValue;
+        patientSince = DateTime.MinValue;
+        patientWaitUntil = DateTime.MinValue;
+        receiverLostAt = DateTime.MinValue;
+        batch.Clear();
+        batchPos = 0;
+        itemsBefore = 0;
+    }
     private bool multiModeWasOn;
     private string CurrentName => Index >= 0 && Index < Queue.Count
         ? $"{Queue[Index].Name}@{Queue[Index].World}"
@@ -100,6 +164,7 @@ public class Sweeper
         Paused = false;
         Log.Clear();
         totalSent = 0;
+        requeues.Clear();
 
         if (cfg.CrashProtection)
         {
@@ -298,6 +363,9 @@ public class Sweeper
         usingLifestreamPath = false;
         settleStart = DateTime.MinValue;
 
+        // Don't sit out a backoff that expired while we were paused.
+        patientWaitUntil = DateTime.MinValue;
+
         AddLog(CurrentName, $"Resumed ({State}).");
     }
 
@@ -308,6 +376,15 @@ public class Sweeper
         State = s;
         deadline = DateTime.Now.AddSeconds(timeoutSeconds);
     }
+
+    // Deadline for the trade states. With patient retry on, a single OpenTrade step
+    // may legitimately sit there for many minutes waiting for the receiver to free
+    // up — so the step timeout has to be at least as long as the patience budget,
+    // or the deadline would kill the very wait we asked for.
+    private int TradeStepTimeout =>
+        cfg.PatientRetry
+            ? Math.Max(cfg.TradeTimeout, cfg.PatientRetryMinutes * 60 + 60)
+            : cfg.TradeTimeout;
 
     private void AddLog(string chara, string msg, bool error = false)
     {
@@ -588,7 +665,7 @@ public class Sweeper
         {
             if (moveIssued) PluginIpc.VnavStop();
             AddLog(CurrentName, $"In range ({dist:F1}y).");
-            Goto(SweepState.OpenTrade, cfg.TradeTimeout);
+            Goto(SweepState.OpenTrade, TradeStepTimeout);
             return;
         }
 
@@ -635,6 +712,34 @@ public class Sweeper
 
     private void DoOpenTrade()
     {
+        // Backing off after a failed attempt — the receiver is most likely mid-trade
+        // with another account.
+        if (patientWaitUntil > DateTime.Now) return;
+
+        // Patience is for a receiver who's *busy*, not one who isn't there. If they've
+        // vanished from the object table entirely (logged out, changed zone, moved
+        // instance), waiting fifteen minutes just wastes fifteen minutes — the trade
+        // is never going to land. Bail out early so they get requeued or skipped now.
+        if (cfg.PatientRetry && patientSince != DateTime.MinValue)
+        {
+            if (TradeEngine.FindPlayer(cfg.MainFull) == null)
+            {
+                if ((DateTime.Now - receiverLostAt).TotalSeconds > 45
+                    && receiverLostAt != DateTime.MinValue)
+                {
+                    if (cfg.RequeueOnBusy && Requeue()) return;
+                    Fail($"{cfg.MainFull} is no longer nearby — they may have logged out " +
+                         "or changed instance. Not worth waiting out the retry budget.");
+                    return;
+                }
+                if (receiverLostAt == DateTime.MinValue) receiverLostAt = DateTime.Now;
+            }
+            else
+            {
+                receiverLostAt = DateTime.MinValue;
+            }
+        }
+
         // Re-plan what's left every time we open a window: gil and item counts are
         // always read from the game, never tracked in a counter, so a failed trade
         // self-corrects instead of losing track.
@@ -848,22 +953,69 @@ public class Sweeper
         if (gilMoved <= 0 && itemsMoved <= 0)
         {
             tradeFailures++;
-            if (tradeFailures >= MaxTradeFailures)
-            {
-                Fail($"Trade failed {tradeFailures}x in a row (nothing moved). " +
-                     "Is the receiving character busy, full, or declining?");
-                return;
-            }
 
-            AddLog(CurrentName,
-                $"Trade didn't go through. Retrying {tradeFailures}/{MaxTradeFailures}.",
-                true);
+            if (cfg.PatientRetry)
+            {
+                // Start the clock on the first failure for this character.
+                if (patientSince == DateTime.MinValue)
+                    patientSince = DateTime.Now;
+
+                var waited = DateTime.Now - patientSince;
+                var budget = TimeSpan.FromMinutes(Math.Max(1, cfg.PatientRetryMinutes));
+
+                if (waited >= budget)
+                {
+                    // The receiver being busy is transient, so don't write this
+                    // character off — put them at the back of the queue and come
+                    // back once everyone else is done. By then the main is very
+                    // likely free.
+                    if (cfg.RequeueOnBusy && Requeue())
+                        return;
+
+                    Fail($"Trade still not going through after {waited.TotalMinutes:F0} minutes " +
+                         $"({tradeFailures} attempts). Giving up on this character.");
+                    return;
+                }
+
+                // Back off between attempts — the receiver is most likely mid-trade
+                // with another account, and hammering them doesn't help. Jittered so
+                // that two accounts retrying on the same cadence don't stay locked in
+                // step with each other, colliding forever.
+                var baseDelay = Math.Max(1, cfg.PatientRetryDelaySeconds);
+                var jitter = jitterRng.Next(0, Math.Max(1, baseDelay / 2));
+                patientWaitUntil = DateTime.Now.AddSeconds(baseDelay + jitter);
+
+                var left = budget - waited;
+                AddLog(CurrentName,
+                    $"Trade didn't go through (attempt {tradeFailures}) — the receiver is " +
+                    $"probably busy. Retrying in {baseDelay + jitter}s. " +
+                    $"{left.TotalMinutes:F0}m left before giving up.");
+            }
+            else
+            {
+                if (tradeFailures >= MaxTradeFailures)
+                {
+                    Fail($"Trade failed {tradeFailures}x in a row (nothing moved). " +
+                         "Is the receiving character busy, full, or declining? " +
+                         "Turn on \"Keep retrying while the receiver is busy\" if you're " +
+                         "running several accounts into the same character.");
+                    return;
+                }
+
+                AddLog(CurrentName,
+                    $"Trade didn't go through. Retrying {tradeFailures}/{MaxTradeFailures}.",
+                    true);
+            }
         }
         else
         {
             totalSent += gilMoved > 0 ? gilMoved : 0;
             charSent += gilMoved > 0 ? gilMoved : 0;
             tradeFailures = 0;
+
+            // Progress resets patience — the receiver clearly isn't stuck.
+            patientSince = DateTime.MinValue;
+            patientWaitUntil = DateTime.MinValue;
 
             var parts = new List<string>();
             if (gilMoved > 0) parts.Add($"{gilMoved:N0} gil");
@@ -878,7 +1030,7 @@ public class Sweeper
 
         gilToSend = remaining;
         settleStart = DateTime.MinValue;
-        Goto(SweepState.OpenTrade, cfg.TradeTimeout);
+        Goto(SweepState.OpenTrade, TradeStepTimeout);
     }
 
     // How many individual units of the configured items are still above their floor.
@@ -1162,6 +1314,8 @@ public class Sweeper
         itemsBefore = 0;
         tradeFailures = 0;
         settleStart = DateTime.MinValue;
+        patientSince = DateTime.MinValue;
+        patientWaitUntil = DateTime.MinValue;
 
         if (Index >= Queue.Count)
         {
@@ -1176,7 +1330,11 @@ public class Sweeper
                 catch (Exception ex) { Plugin.Log.Warning($"Couldn't clear run state: {ex.Message}"); }
             }
 
-            AddLog("", $"Sweep complete. {totalSent:N0} gil moved to {cfg.MainFull}.");
+            var summary = $"Sweep complete. {totalSent:N0} gil moved to {cfg.MainFull}.";
+            if (requeues.Count > 0)
+                summary += $" {requeues.Count} character(s) had to be retried " +
+                           "because the receiver was busy.";
+            AddLog("", summary);
             return;
         }
 

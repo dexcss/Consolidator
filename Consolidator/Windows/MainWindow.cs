@@ -79,6 +79,13 @@ public class MainWindow : Window, IDisposable
             ImGui.TextColored(ImGuiColors.DalamudOrange,
                 $"  PAUSED — {Sweep.State}  ({Sweep.Index + 1}/{Sweep.Queue.Count})");
         }
+        else if (Sweep.Running && Sweep.WaitingSeconds > 0)
+        {
+            // Without this a patient retry just looks like the plugin has hung.
+            ImGui.TextColored(ImGuiColors.DalamudOrange,
+                $"  Receiver busy — retrying in {Sweep.WaitingSeconds}s  " +
+                $"({Sweep.Index + 1}/{Sweep.Queue.Count})");
+        }
         else if (Sweep.Running)
         {
             ImGui.TextColored(ImGuiColors.DalamudYellow,
@@ -845,6 +852,70 @@ public class MainWindow : Window, IDisposable
             ImGuiComponents.HelpMarker(
                 "A stale figure isn't trusted — those characters get logged into and\n" +
                 "checked properly instead. 0 = trust any figure, however old.");
+            ImGui.Unindent();
+        }
+
+        if (ImGui.Checkbox("Keep retrying while the receiver is busy", ref Cfg.PatientRetry))
+            Cfg.Save();
+        ImGuiComponents.HelpMarker(
+            "Normally a trade that doesn't go through is retried 3 times, then the\n" +
+            "character is skipped.\n\n" +
+            "If you're running several accounts into the same main, the receiver will\n" +
+            "often just be mid-trade with someone else. That isn't a failure, it's\n" +
+            "contention — so this waits it out instead of giving up.\n\n" +
+            "There's still a time limit, so a genuinely stuck run (receiver logged out,\n" +
+            "inventory full) can't stall the queue forever.");
+
+        if (Cfg.PatientRetry)
+        {
+            ImGui.Indent();
+
+            ImGui.SetNextItemWidth(120);
+            if (ImGui.InputInt("Give up after (minutes)", ref Cfg.PatientRetryMinutes))
+            {
+                Cfg.PatientRetryMinutes = Math.Clamp(Cfg.PatientRetryMinutes, 1, 240);
+                Cfg.Save();
+            }
+            ImGuiComponents.HelpMarker(
+                "How long to keep trying one character before moving on. The clock\n" +
+                "resets whenever a trade actually succeeds.");
+
+            ImGui.SetNextItemWidth(120);
+            if (ImGui.InputInt("Wait between attempts (seconds)", ref Cfg.PatientRetryDelaySeconds))
+            {
+                Cfg.PatientRetryDelaySeconds = Math.Clamp(Cfg.PatientRetryDelaySeconds, 1, 300);
+                Cfg.Save();
+            }
+            ImGuiComponents.HelpMarker(
+                "Backing off between attempts. The receiver is busy — retrying every\n" +
+                "second doesn't make them any less busy.\n\n" +
+                "Jittered slightly, so two accounts retrying on the same cadence can't\n" +
+                "stay locked in step and keep colliding.");
+
+            if (ImGui.Checkbox("Retry busy characters at the end of the run",
+                               ref Cfg.RequeueOnBusy)) Cfg.Save();
+            ImGuiComponents.HelpMarker(
+                "When a character runs out of patience, move them to the back of the\n" +
+                "queue instead of skipping them.\n\n" +
+                "A busy receiver is temporary — by the time the rest of the run is done\n" +
+                "they're very likely free. Without this, an unlucky run can quietly skip\n" +
+                "several characters and you'd only find out from the log.");
+
+            if (Cfg.RequeueOnBusy)
+            {
+                ImGui.Indent();
+                ImGui.SetNextItemWidth(120);
+                if (ImGui.InputInt("Times to requeue", ref Cfg.MaxRequeues))
+                {
+                    Cfg.MaxRequeues = Math.Clamp(Cfg.MaxRequeues, 1, 5);
+                    Cfg.Save();
+                }
+                ImGuiComponents.HelpMarker(
+                    "How many times one character can go to the back of the queue before\n" +
+                    "we accept it's not going to work.");
+                ImGui.Unindent();
+            }
+
             ImGui.Unindent();
         }
 
