@@ -53,8 +53,14 @@ public static unsafe class TradeEngine
         return ItemHook.Offer(s.Type, s.Slot);
     }
 
-    // True when the whole stack goes over, so no quantity prompt appears.
-    public static bool IsWholeStack(TradeSlot s) => s.Take >= s.InStack;
+    // True when offering this slot will NOT pop a quantity prompt. The game shows the
+    // InputNumeric popup whenever the stack has more than one item — even if we're
+    // taking the whole stack. Only a genuine single-item stack goes straight in.
+    //
+    // (This was the "trades 1 at a time / won't confirm" bug: a stack of 200 pops the
+    // prompt, we didn't answer it, and the open modal both left the item unfilled and
+    // blocked the confirm.)
+    public static bool GoesStraightIn(TradeSlot s) => s.InStack <= 1;
 
     public static bool GenericThrottle => FrameThrottler.Throttle("Cons.TaskThrottle", 4);
 
@@ -400,6 +406,31 @@ public static unsafe class TradeEngine
             if (!TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon)) return false;
             if (!IsAddonReady(addon)) return false;
             if (!EzThrottler.Throttle("Cons.EntranceYes", 1000)) return false;
+
+            Callback.Fire(addon, true, 0);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // The "Trade these items?" confirmation the sender gets after locking the trade.
+    // Separate from the entrance one so it can honour NoOp — a dry run must not click
+    // Yes on a real trade. Returns true if a dialog was present and handled.
+    public static bool ConfirmTradeYesno(bool noOp)
+    {
+        try
+        {
+            if (!TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon)) return false;
+            if (!IsAddonReady(addon)) return false;
+            if (!EzThrottler.Throttle("Cons.TradeYes", 1000)) return false;
+
+            if (noOp)
+            {
+                Plugin.Log.Information("[NoOp] Would have confirmed the trade dialog.");
+                // Cancel out instead, so a dry run doesn't actually trade.
+                Callback.Fire(addon, true, 1);
+                return true;
+            }
 
             Callback.Fire(addon, true, 0);
             return true;

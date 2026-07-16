@@ -870,8 +870,9 @@ public class Sweeper
 
         if (TradeEngine.OfferItem(slot))
         {
-            // A partial stack pops a quantity prompt; a whole stack goes straight in.
-            if (TradeEngine.IsWholeStack(slot))
+            // Any stack with more than one item pops a quantity prompt — even when
+            // we're taking all of it. Only a true single goes straight in.
+            if (TradeEngine.GoesStraightIn(slot))
             {
                 AddLog(CurrentName, $"Added {slot.Take:N0}x {slot.Name}.");
                 batchPos++;
@@ -908,6 +909,12 @@ public class Sweeper
             Goto(SweepState.WaitTradeClose, cfg.TradeTimeout);
             return;
         }
+
+        // Locking the trade (stage 1) pops a "Trade these items?" SelectYesno that
+        // the sender also has to answer (stage 2). Handle that here — clicking the
+        // trade button alone leaves the run stuck on the confirmation dialog.
+        if (TradeEngine.ConfirmTradeYesno(cfg.NoOp))
+            return;
 
         if (TradeEngine.ConfirmTrade(cfg.NoOp))
             Goto(SweepState.WaitTradeClose, cfg.TradeTimeout);
