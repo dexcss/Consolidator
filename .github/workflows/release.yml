@@ -49,8 +49,10 @@ jobs:
           Copy-Item $json ./Consolidator.json -Force
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.2.1
         with:
+          tag_name: ${{ github.ref_name }}
           files: |
             Consolidator.zip
             Consolidator.json
+          generate_release_notes: true
