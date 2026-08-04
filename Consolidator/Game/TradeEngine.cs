@@ -297,8 +297,39 @@ public static unsafe class TradeEngine
         return true;
     }
 
+    // A SelectYesno sitting open while no trade window is up — the residue of an
+    // interrupted trade. It's modal and blocks the next /trade, so we detect and
+    // clear it before opening a new trade.
+    public static bool HasStaleTradeDialog =>
+        !IsTradeOpen
+        && TryGetAddonByName<AtkUnitBase>("SelectYesno", out var a)
+        && IsAddonReady(a);
+
+    public static void DismissStaleDialog()
+    {
+        try
+        {
+            if (!EzThrottler.Throttle("Cons.DismissStale", 500)) return;
+            if (TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon) && IsAddonReady(addon))
+                Callback.Fire(addon, true, 1);   // No
+        }
+        catch { /* ignore */ }
+    }
+
+    // Tear down a trade cleanly. Critically, this also dismisses any lingering
+    // "Trade these items?" SelectYesno — if a timeout fires mid-confirm, that dialog
+    // is left open and modal, silently blocking every trade for the rest of the run
+    // ("wouldn't confirm anymore"). Cancelling the Trade window alone doesn't clear
+    // it, so we answer No to the dialog first.
     public static void CancelTrade()
     {
+        try
+        {
+            if (TryGetAddonByName<AtkUnitBase>("SelectYesno", out var yn) && IsAddonReady(yn))
+                Callback.Fire(yn, true, 1);   // No — back out of the confirmation
+        }
+        catch { /* ignore */ }
+
         try
         {
             if (TryGetAddonByName<AtkUnitBase>("Trade", out var addon) && IsAddonReady(addon))

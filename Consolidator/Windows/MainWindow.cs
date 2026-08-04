@@ -871,14 +871,26 @@ public class MainWindow : Window, IDisposable
             ImGui.Indent();
 
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Give up after (minutes)", ref Cfg.PatientRetryMinutes))
+            if (ImGui.InputInt("Give up after (minutes, 0 = never)", ref Cfg.PatientRetryMinutes))
             {
-                Cfg.PatientRetryMinutes = Math.Clamp(Cfg.PatientRetryMinutes, 1, 240);
+                Cfg.PatientRetryMinutes = Math.Clamp(Cfg.PatientRetryMinutes, 0, 240);
                 Cfg.Save();
             }
             ImGuiComponents.HelpMarker(
                 "How long to keep trying one character before moving on. The clock\n" +
-                "resets whenever a trade actually succeeds.");
+                "resets whenever a trade actually succeeds.\n\n" +
+                "Set to 0 to never give up — the run will wait on a character forever,\n" +
+                "including while you do something manual on the main (like offloading to\n" +
+                "a retainer). Nothing else will time out either while it's waiting to\n" +
+                "trade. Use this when you're supervising the run.");
+
+            if (Cfg.PatientRetryMinutes == 0)
+            {
+                ImGui.Indent();
+                ImGui.TextColored(ImGuiColors.DalamudOrange,
+                    "Never gives up — a stuck run will wait indefinitely.");
+                ImGui.Unindent();
+            }
 
             ImGui.SetNextItemWidth(120);
             if (ImGui.InputInt("Wait between attempts (seconds)", ref Cfg.PatientRetryDelaySeconds))

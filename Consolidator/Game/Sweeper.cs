@@ -377,6 +377,27 @@ public class Sweeper
         deadline = DateTime.Now.AddSeconds(timeoutSeconds);
     }
 
+    // With patient retry on, the user has explicitly accepted that a run may sit
+    // indefinitely waiting on the receiver — so we don't time out while we're in the
+    // "dealing with the receiver" span of states. This covers the case where the
+    // receiver is busy *and* the case where the user is doing something manual on the
+    // main (e.g. offloading to a retainer) before it's free to trade.
+    //
+    // Only these states are suppressed. Travel, login, and FC-return keep their
+    // deadlines: if one of *those* hangs, something is genuinely wrong and waiting
+    // forever would just hide it.
+    private bool DeadlineSuppressed =>
+        cfg.PatientRetry && State is
+            SweepState.LocateMain or
+            SweepState.Approach or
+            SweepState.OpenTrade or
+            SweepState.WaitTradeOpen or
+            SweepState.EnterGil or
+            SweepState.OfferItems or
+            SweepState.EnterItemQty or
+            SweepState.ConfirmTrade or
+            SweepState.WaitTradeClose;
+
     // Deadline for the trade states. With patient retry on, a single OpenTrade step
     // may legitimately sit there for many minutes waiting for the receiver to free
     // up — so the step timeout has to be at least as long as the patience budget,
@@ -412,7 +433,7 @@ public class Sweeper
         if (!Running) return;
         if (Paused) return;
 
-        if (DateTime.Now > deadline)
+        if (DateTime.Now > deadline && !DeadlineSuppressed)
         {
             Fail($"Timed out during {State}.");
             return;
@@ -712,15 +733,26 @@ public class Sweeper
 
     private void DoOpenTrade()
     {
+        // A leftover "Trade these items?" dialog from a previous, interrupted trade
+        // is modal and will block this one silently. Clear it before we do anything.
+        if (!TradeEngine.IsTradeOpen && TradeEngine.HasStaleTradeDialog)
+        {
+            TradeEngine.DismissStaleDialog();
+            return;
+        }
+
         // Backing off after a failed attempt — the receiver is most likely mid-trade
         // with another account.
         if (patientWaitUntil > DateTime.Now) return;
 
         // Patience is for a receiver who's *busy*, not one who isn't there. If they've
         // vanished from the object table entirely (logged out, changed zone, moved
-        // instance), waiting fifteen minutes just wastes fifteen minutes — the trade
-        // is never going to land. Bail out early so they get requeued or skipped now.
-        if (cfg.PatientRetry && patientSince != DateTime.MinValue)
+        // instance), waiting just wastes time — the trade is never going to land. Bail
+        // out early so they get requeued or skipped now.
+        //
+        // Skipped when the budget is 0 ("never give up"): the user has said to wait
+        // no matter what, which includes the main stepping away to a retainer bell.
+        if (cfg.PatientRetry && cfg.PatientRetryMinutes > 0 && patientSince != DateTime.MinValue)
         {
             if (TradeEngine.FindPlayer(cfg.MainFull) == null)
             {
@@ -968,9 +1000,14 @@ public class Sweeper
                     patientSince = DateTime.Now;
 
                 var waited = DateTime.Now - patientSince;
-                var budget = TimeSpan.FromMinutes(Math.Max(1, cfg.PatientRetryMinutes));
 
-                if (waited >= budget)
+                // A budget of 0 means "never give up" — keep waiting on this
+                // character indefinitely. Anything above 0 requeues (or fails) once
+                // the budget is spent, which is the multi-account contention case.
+                var giveUp = cfg.PatientRetryMinutes > 0
+                             && waited >= TimeSpan.FromMinutes(cfg.PatientRetryMinutes);
+
+                if (giveUp)
                 {
                     // The receiver being busy is transient, so don't write this
                     // character off — put them at the back of the queue and come
@@ -992,11 +1029,12 @@ public class Sweeper
                 var jitter = jitterRng.Next(0, Math.Max(1, baseDelay / 2));
                 patientWaitUntil = DateTime.Now.AddSeconds(baseDelay + jitter);
 
-                var left = budget - waited;
+                var tail = cfg.PatientRetryMinutes > 0
+                    ? $"{(TimeSpan.FromMinutes(cfg.PatientRetryMinutes) - waited).TotalMinutes:F0}m left before giving up."
+                    : "will keep waiting until it goes through.";
                 AddLog(CurrentName,
                     $"Trade didn't go through (attempt {tradeFailures}) — the receiver is " +
-                    $"probably busy. Retrying in {baseDelay + jitter}s. " +
-                    $"{left.TotalMinutes:F0}m left before giving up.");
+                    $"probably busy. Retrying in {baseDelay + jitter}s. {tail}");
             }
             else
             {
