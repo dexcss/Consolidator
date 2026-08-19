@@ -873,12 +873,14 @@ public class MainWindow : Window, IDisposable
             ImGui.SetNextItemWidth(120);
             if (ImGui.InputInt("Give up after (minutes, 0 = never)", ref Cfg.PatientRetryMinutes))
             {
-                Cfg.PatientRetryMinutes = Math.Clamp(Cfg.PatientRetryMinutes, 0, 240);
+                // Free-entry: 0 means never give up, otherwise anything up to a day.
+                Cfg.PatientRetryMinutes = Math.Clamp(Cfg.PatientRetryMinutes, 0, 1440);
                 Cfg.Save();
             }
             ImGuiComponents.HelpMarker(
                 "How long to keep trying one character before moving on. The clock\n" +
-                "resets whenever a trade actually succeeds.\n\n" +
+                "resets whenever a trade actually succeeds. Type any value up to 1440\n" +
+                "(24 hours).\n\n" +
                 "Set to 0 to never give up — the run will wait on a character forever,\n" +
                 "including while you do something manual on the main (like offloading to\n" +
                 "a retainer). Nothing else will time out either while it's waiting to\n" +

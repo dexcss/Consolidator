@@ -88,6 +88,23 @@ public class Sweeper
         var c = Queue[Index];
         var key = c.Full;
 
+        // If this is the only character still in the queue, there's nobody to run
+        // "first" — requeuing just puts them back in the same slot. Counting that
+        // toward the requeue cap would eventually give up on a lone busy target,
+        // which is the opposite of what patient retry is for. So keep waiting on
+        // them instead: reset the patience clock and try again.
+        var othersWaiting = Queue.Count(x => x.Enabled) > 1;
+        if (!othersWaiting)
+        {
+            AddLog(c.Full,
+                "Still the only character left and the receiver's busy — will keep " +
+                "waiting rather than give up.");
+            patientSince = DateTime.MinValue;   // restart the clock, keep trying
+            patientWaitUntil = DateTime.Now.AddSeconds(Math.Max(1, cfg.PatientRetryDelaySeconds));
+            Goto(SweepState.OpenTrade, TradeStepTimeout);
+            return true;
+        }
+
         requeues.TryGetValue(key, out var count);
         if (count >= Math.Max(0, cfg.MaxRequeues)) return false;
 
@@ -165,6 +182,7 @@ public class Sweeper
         Log.Clear();
         totalSent = 0;
         requeues.Clear();
+        failed.Clear();
 
         if (cfg.CrashProtection)
         {
@@ -228,6 +246,8 @@ public class Sweeper
         Running = true;
         Paused = false;
         Log.Clear();
+        requeues.Clear();
+        failed.Clear();
 
         multiModeWasOn = PluginIpc.GetMultiModeEnabled();
         if (multiModeWasOn) PluginIpc.SetMultiModeEnabled(false);
@@ -419,12 +439,20 @@ public class Sweeper
     private void Fail(string why)
     {
         AddLog(CurrentName, why, true);
+
+        // Remember who we couldn't finish, so "sweep complete" doesn't pretend
+        // everyone got done.
+        if (Index >= 0 && Index < Queue.Count)
+            failed.Add(Queue[Index].Full);
+
         PluginIpc.LifestreamAbort();
         PluginIpc.VnavStop();
         TradeEngine.CancelTrade();
         if (cfg.StopOnError) { Stop("Halted: StopOnError is enabled."); return; }
         Goto(SweepState.NextCharacter, 10);
     }
+
+    private readonly HashSet<string> failed = new();
 
     // ---------- tick ----------
 
@@ -1379,7 +1407,10 @@ public class Sweeper
             if (requeues.Count > 0)
                 summary += $" {requeues.Count} character(s) had to be retried " +
                            "because the receiver was busy.";
-            AddLog("", summary);
+            if (failed.Count > 0)
+                summary += $" {failed.Count} character(s) could NOT be completed: " +
+                           $"{string.Join(", ", failed)}.";
+            AddLog("", summary, failed.Count > 0);
             return;
         }
 
