@@ -76,11 +76,18 @@ public static unsafe class TradeEngine
     // FFXIV happily allows the same name on two different worlds, and comparing on
     // name alone is what let a sweep run against the wrong character (see
     // Sweeper.IsLoggedInAs).
+    //
+    // Read off PlayerState rather than IClientState — Dalamud dropped
+    // IClientState.LocalContentId, so this is the supported route on API 15.
     public static ulong LocalContentId
     {
         get
         {
-            try { return Svc.ClientState.LocalContentId; }
+            try
+            {
+                var ps = FFXIVClientStructs.FFXIV.Client.Game.UI.PlayerState.Instance();
+                return ps == null ? 0 : ps->ContentId;
+            }
             catch { return 0; }
         }
     }
