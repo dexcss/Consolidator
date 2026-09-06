@@ -127,6 +127,7 @@ public class Sweeper
 
     private void ResetPerCharacter()
     {
+        wrongCharWarned = false;
         gilToSend = 0;
         thisTrade = 0;
         charSent = 0;
@@ -147,6 +148,54 @@ public class Sweeper
     private string CurrentName => Index >= 0 && Index < Queue.Count
         ? $"{Queue[Index].Name}@{Queue[Index].World}"
         : "";
+
+    // Set once we've complained about being on the wrong character, so WaitLogin
+    // doesn't repeat itself every framework tick. Cleared per character.
+    private bool wrongCharWarned;
+
+    // Are we logged in as exactly this roster row?
+    //
+    // Name alone is NOT an identity. FFXIV allows the same character name on two
+    // different worlds, and this roster has them. The old check was
+    // `TradeEngine.PlayerName == c.Name`, so whenever a same-named character
+    // happened to already be logged in, DoRelog decided it was "already on" the
+    // queued character, skipped the relog entirely, and WaitLogin waved it through
+    // — the sweep then drained whoever was actually logged in while stamping every
+    // log line with the QUEUED row's world. That's the "said Twintania, emptied
+    // Adamantoise" bug.
+    //
+    // ContentId is unique across worlds and accounts, so prefer it. Hand-added rows
+    // have no CID, so fall back to the home world (stable across Lifestream travel,
+    // unlike the current world). If neither side can be compared, accept — that's
+    // the old behaviour and the only sane answer when there's nothing to check.
+    private static bool IsLoggedInAs(CharEntry c, out string mismatch)
+    {
+        mismatch = "";
+        if (!Player.Available) return false;
+
+        // Different name is an outright no, and not worth reporting — it just means
+        // the relog hasn't landed yet.
+        if (!string.Equals(TradeEngine.PlayerName, c.Name, StringComparison.Ordinal))
+            return false;
+
+        var cid = TradeEngine.LocalContentId;
+        if (c.Cid != 0 && cid != 0)
+        {
+            if (cid == c.Cid) return true;
+            mismatch = $"content ID {cid:X} is not {c.Cid:X}";
+            return false;
+        }
+
+        var home = TradeEngine.HomeWorldName;
+        if (string.IsNullOrWhiteSpace(c.World) || string.IsNullOrWhiteSpace(home))
+            return true;                                   // nothing to compare
+
+        if (string.Equals(home, c.World, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        mismatch = $"home world is {home}, not {c.World}";
+        return false;
+    }
 
     public Sweeper(Configuration cfg) => this.cfg = cfg;
 
@@ -179,6 +228,7 @@ public class Sweeper
         Index = 0;
         Running = true;
         Paused = false;
+        wrongCharWarned = false;
         Log.Clear();
         totalSent = 0;
         requeues.Clear();
@@ -245,6 +295,7 @@ public class Sweeper
         totalSent = cfg.Run.TotalSent;
         Running = true;
         Paused = false;
+        wrongCharWarned = false;
         Log.Clear();
         requeues.Clear();
         failed.Clear();
@@ -515,11 +566,18 @@ public class Sweeper
 
         // If we're already on this character, skip the relog but still run the
         // balance check by dropping into WaitLogin, which will pass immediately.
-        if (Player.Available && TradeEngine.PlayerName == c.Name)
+        if (IsLoggedInAs(c, out var notThem))
         {
             Goto(SweepState.WaitLogin, cfg.LoginTimeout);
             return;
         }
+
+        // A same-named character on another world is somebody else. Say so out loud
+        // and relog properly — silently treating them as a match is exactly how the
+        // wrong character got emptied.
+        if (!string.IsNullOrEmpty(notThem))
+            AddLog(CurrentName,
+                $"Already logged in as a different {c.Name} ({notThem}) — relogging.");
 
         // AR's relog is a chat command, not IPC — this is the path FCTracker proved.
         Svc.Commands.ProcessCommand($"/autoretainer relog {c.Name}@{c.World}");
@@ -568,7 +626,24 @@ public class Sweeper
     {
         var c = Queue[Index];
         if (!Player.Available) return;                 // still on loading/char select
-        if (TradeEngine.PlayerName != c.Name) return;            // not there yet
+
+        // Nothing past this point may run against a character we haven't positively
+        // identified — the next states hand over gil and items.
+        if (!IsLoggedInAs(c, out var notThem))
+        {
+            // Right name, wrong character: AR landed on a same-named alt. Keep
+            // waiting (the login deadline will fail them cleanly) but leave a trail,
+            // rather than trading away somebody who isn't in the queue.
+            if (!string.IsNullOrEmpty(notThem) && !wrongCharWarned)
+            {
+                wrongCharWarned = true;
+                AddLog(CurrentName,
+                    $"Logged-in {c.Name} is not this one ({notThem}) — waiting for the "
+                    + "right character rather than trading.", true);
+            }
+            return;
+        }
+
         if (Svc.Condition[ConditionFlag.BetweenAreas]) return;
 
         AddLog(CurrentName, "Logged in.");
@@ -1376,6 +1451,7 @@ public class Sweeper
         charSent = 0;
 
         Index++;
+        wrongCharWarned = false;
         gilToSend = 0;
         thisTrade = 0;
         moveIssued = false;

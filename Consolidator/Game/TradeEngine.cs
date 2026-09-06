@@ -69,6 +69,36 @@ public static unsafe class TradeEngine
     // every call site, funnel access through these — the guard lives in one place.
     public static string PlayerName => Player.Available ? (Player.Name ?? "") : "";
 
+    // ContentId of the character currently logged in; 0 when we're at character
+    // select or the client hasn't reported one yet.
+    //
+    // This is the ONLY player identity that is unique everywhere. A name is not:
+    // FFXIV happily allows the same name on two different worlds, and comparing on
+    // name alone is what let a sweep run against the wrong character (see
+    // Sweeper.IsLoggedInAs).
+    public static ulong LocalContentId
+    {
+        get
+        {
+            try { return Svc.ClientState.LocalContentId; }
+            catch { return 0; }
+        }
+    }
+
+    // "Name@HomeWorld" for the logged-in character, matching CharEntry.Full.
+    // Home world, not current world — Lifestream travel changes the latter, so only
+    // the home world stays comparable to a roster row mid-run.
+    public static string PlayerFull
+    {
+        get
+        {
+            var n = PlayerName;
+            if (string.IsNullOrEmpty(n)) return "";
+            var w = HomeWorldName;
+            return string.IsNullOrEmpty(w) ? n : $"{n}@{w}";
+        }
+    }
+
     private static Dalamud.Game.ClientState.Objects.SubKinds.IPlayerCharacter? Me =>
         Player.Available ? Player.Object : null;
 

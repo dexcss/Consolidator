@@ -46,7 +46,6 @@ jobs:
           if (-not (Test-Path $json)) { Copy-Item Consolidator/Consolidator.json $json }
 
           Compress-Archive -Path "$dir/*" -DestinationPath Consolidator.zip -Force
-          Copy-Item $json ./Consolidator.json -Force
 
       - name: Release
         uses: softprops/action-gh-release@v2.2.1
@@ -54,5 +53,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: |
             Consolidator.zip
-            Consolidator.json
           generate_release_notes: true
