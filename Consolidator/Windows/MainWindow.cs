@@ -395,6 +395,8 @@ public class MainWindow : Window, IDisposable
         ImGui.TextColored(ImGuiColors.DalamudGrey,
             $"{Cfg.Characters.Count(c => c.Enabled)} of {Cfg.Characters.Count} enabled");
 
+        DrawGilTotal();
+
         ImGui.Spacing();
 
         // WYSIWYG: whatever this table shows, top to bottom, is what the run does.
@@ -554,6 +556,59 @@ public class MainWindow : Window, IDisposable
     {
         for (var i = 0; i < Cfg.Characters.Count; i++)
             Cfg.Characters[i].Order = i;
+    }
+
+    // Total gil sitting across the roster, from the per-character figures AR keeps
+    // up to date. Deliberately a sum of LastSeenGil and nothing cleverer: these are
+    // cached numbers, not live ones, so the honest thing is to show the total and
+    // say plainly how stale the worst of it is.
+    private void DrawGilTotal()
+    {
+        var all = Cfg.Characters;
+        if (all.Count == 0) return;
+
+        var known = all.Where(c => c.LastSeenGilAt != DateTime.MinValue).ToList();
+        if (known.Count == 0)
+        {
+            ImGui.TextColored(ImGuiColors.DalamudGrey,
+                "Total gil: unknown — hit \"Refresh gil\" to pull figures from AutoRetainer.");
+            return;
+        }
+
+        var total = known.Sum(c => c.LastSeenGil);
+        var enabledTotal = known.Where(c => c.Enabled).Sum(c => c.LastSeenGil);
+        var missing = all.Count - known.Count;
+
+        // Oldest reading in the set — the total is only as trustworthy as this.
+        var oldest = known.Min(c => c.LastSeenGilAt);
+
+        ImGui.TextColored(ImGuiColors.DalamudViolet, $"Total gil: {total:N0}");
+
+        if (enabledTotal != total)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(ImGuiColors.DalamudGrey, $"({enabledTotal:N0} enabled)");
+        }
+
+        ImGui.SameLine();
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            missing > 0
+                ? $"across {known.Count} characters, {missing} with no figure yet"
+                : $"across {known.Count} characters");
+
+        if (ImGui.IsItemHovered())
+        {
+            var floor = Cfg.Items.FirstOrDefault(i => i.IsGil)?.KeepAmount ?? 0;
+            var spare = known.Where(c => c.Enabled && c.LastSeenGil > floor)
+                             .Sum(c => c.LastSeenGil - floor);
+
+            ImGui.SetTooltip(
+                $"{total:N0} gil total ({Abbrev(total)})\n"
+                + $"{enabledTotal:N0} on enabled characters\n"
+                + $"~{spare:N0} collectable at the current {floor:N0} floor\n\n"
+                + $"Oldest reading: {Ago(oldest)}\n"
+                + "Figures come from AutoRetainer's cache, not a live count.");
+        }
     }
 
     private static string Abbrev(long gil) => gil switch
