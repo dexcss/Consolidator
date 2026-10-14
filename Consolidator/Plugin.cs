@@ -67,7 +67,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(Command, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open Consolidator. /cons start | pause | resume | stop | dispense",
+            HelpMessage = "Open Consolidator. /cons start | collect | pause | resume | stop | dispense",
         });
 
         PluginInterface.UiBuilder.Draw += Windows.Draw;
@@ -104,6 +104,7 @@ public sealed class Plugin : IDalamudPlugin
         switch (args.Trim().ToLowerInvariant())
         {
             case "start": Sweeper.Start(); break;
+            case "collect": Sweeper.Start(collect: true); break;
             case "stop": Sweeper.Stop(); break;
             case "pause": Sweeper.Pause(); break;
             case "resume": Sweeper.Resume(); break;

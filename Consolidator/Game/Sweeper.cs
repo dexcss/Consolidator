@@ -55,6 +55,20 @@ public class Sweeper
     public bool Running { get; private set; }
     public bool Paused { get; private set; }
 
+    // A collection run: walk every character to the receiver to pick up a handout,
+    // rather than to drop anything off.
+    //
+    // It's the same machinery as a sweep — same queue, same order, same crash
+    // protection — with the two "has this character got anything worth the trip?"
+    // gates lifted, because on a collection run the answer is always yes. Anything
+    // that IS enabled on the Send tab still goes while they're there.
+    public bool CollectRun { get; private set; }
+
+    // Should this run wait at the receiver for something to come back? True either
+    // because combined mode is on for ordinary sweeps, or because collecting is the
+    // entire purpose of this one.
+    private bool Collecting => CollectRun || cfg.CombinedMode;
+
     // Seconds left on the current patient-retry backoff, or 0 if we're not waiting.
     public int WaitingSeconds =>
         patientWaitUntil > DateTime.Now
@@ -132,6 +146,7 @@ public class Sweeper
         dispenseUntil = DateTime.MinValue;
         dispenseCeiling = DateTime.MinValue;
         tradeRequestedAt = DateTime.MinValue;
+        collectRequested = false;
         gilToSend = 0;
         thisTrade = 0;
         charSent = 0;
@@ -205,7 +220,7 @@ public class Sweeper
 
     // ---------- control ----------
 
-    public string? Validate()
+    public string? Validate(bool collect = false)
     {
         if (!PluginIpc.IsAutoRetainerAvailable()) return "AutoRetainer is not installed or loaded.";
         if (!PluginIpc.IsLifestreamAvailable()) return "Lifestream is not installed or loaded.";
@@ -215,15 +230,29 @@ public class Sweeper
         if (cfg.Characters.Count == 0)
             return "No characters in the list. Add or import some on the Characters tab.";
         if (!cfg.Characters.Any(c => c.Enabled)) return "No characters are enabled.";
+
+        if (collect)
+        {
+            // Nothing needs to be enabled to send — that's the whole point — but
+            // without a wait at the receiver every character would walk over and
+            // turn straight round before anything could be handed to them.
+            if (cfg.DispenseWaitSeconds <= 0)
+                return "Set \"Wait at the receiver\" above 0 on the Dispenser tab, "
+                     + "or characters will leave before they can be given anything.";
+            return null;
+        }
+
         if (!cfg.Items.Any(i => i.Enabled))
             return "Nothing is enabled to send — turn on gil and/or add items.";
         return null;
     }
 
-    public void Start()
+    public void Start(bool collect = false)
     {
-        var err = Validate();
+        var err = Validate(collect);
         if (err != null) { AddLog("", err, true); return; }
+
+        CollectRun = collect;
 
         // The Characters tab list order IS the run order — however it's sorted there
         // is how it runs here. Take it as-is rather than re-ordering behind the
@@ -243,6 +272,7 @@ public class Sweeper
             cfg.Run.Clear();
             cfg.Run.Active = true;
             cfg.Run.StartedAt = DateTime.Now;
+            cfg.Run.Collect = collect;
             cfg.Run.Queue = Queue.Select(c => new CharEntry
             {
                 Cid = c.Cid, Name = c.Name, World = c.World,
@@ -255,7 +285,9 @@ public class Sweeper
         multiModeWasOn = PluginIpc.GetMultiModeEnabled();
         if (multiModeWasOn) PluginIpc.SetMultiModeEnabled(false);
 
-        AddLog("", $"Starting sweep of {Queue.Count} character(s) -> {cfg.MainFull}."
+        AddLog("", (collect
+                       ? $"Starting a collection run: {Queue.Count} character(s) to {cfg.MainFull}."
+                       : $"Starting sweep of {Queue.Count} character(s) -> {cfg.MainFull}.")
                    + (cfg.NoOp ? " [DRY RUN — no trades will be confirmed]" : ""));
 
         // State this outright: if gil is off but gil still moves, the two lines
@@ -291,9 +323,10 @@ public class Sweeper
     {
         if (!CanResume) return;
 
-        var err = Validate();
+        var err = Validate(cfg.Run.Collect);
         if (err != null) { AddLog("", err, true); return; }
 
+        CollectRun = cfg.Run.Collect;
         Queue = cfg.Run.Queue.ToList();
         Index = cfg.Run.Index;
         totalSent = cfg.Run.TotalSent;
@@ -661,10 +694,19 @@ public class Sweeper
 
         if (spareGil <= 0 && spareItems == 0)
         {
-            AddLog(CurrentName, GilEnabled
-                ? $"Skipping — has {have:N0} gil (floor {GilFloor:N0}) and nothing to trade."
-                : "Skipping — nothing on the send list to trade.");
-            Goto(SweepState.NextCharacter, 10);
+            // On a collection run having nothing to give is the normal case, not a
+            // reason to skip — they're making the trip to receive, not to deliver.
+            if (!CollectRun)
+            {
+                AddLog(CurrentName, GilEnabled
+                    ? $"Skipping — has {have:N0} gil (floor {GilFloor:N0}) and nothing to trade."
+                    : "Skipping — nothing on the send list to trade.");
+                Goto(SweepState.NextCharacter, 10);
+                return;
+            }
+
+            AddLog(CurrentName, $"Has {have:N0} gil, nothing to send — going to collect.");
+            Goto(SweepState.ChangeWorld, cfg.TravelTimeout);
             return;
         }
 
@@ -767,7 +809,7 @@ public class Sweeper
             // Normally there'd be no reason to walk over. In combined mode there
             // is: they're still due a handout, and the receiver can only give it to
             // someone standing in front of them.
-            if (!(cfg.CombinedMode && cfg.DispenseWaitSeconds > 0))
+            if (!(Collecting && cfg.DispenseWaitSeconds > 0))
             {
                 AddLog(CurrentName, "Nothing to send.");
                 Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
@@ -856,7 +898,7 @@ public class Sweeper
     // Only ever the configured receiver, and only when they're standing next to us.
     private bool TryAcceptMainTrade()
     {
-        if (!cfg.CombinedMode) return false;
+        if (!Collecting) return false;
         if (TradeEngine.IsTradeOpen) return false;
         if (string.IsNullOrWhiteSpace(cfg.MainFull)) return false;
 
@@ -944,8 +986,13 @@ public class Sweeper
             }
         }
 
-        // Nothing left to hand over.
-        if (thisTrade <= 0 && batch.Count == 0)
+        // On a collection run there's nothing to put in, but one side still has to
+        // open the window — the receiver only ever answers trades, it never starts
+        // one until it's topping somebody up. So open an empty one and let them
+        // fill it. Once per character; after that the receiver drives any follow-up.
+        var openEmpty = CollectRun && !collectRequested && cfg.DispenseWaitSeconds > 0;
+
+        if (thisTrade <= 0 && batch.Count == 0 && !openEmpty)
         {
             AddLog(CurrentName, "Nothing left to send.");
             DoneSending();
@@ -986,10 +1033,14 @@ public class Sweeper
         if (TradeEngine.UseTradeOn(cfg.MainFull))
         {
             tradeRequestedAt = DateTime.Now;
+            collectRequested = true;
+
             var what = thisTrade > 0 ? $"{thisTrade:N0} gil" : "";
             if (batch.Count > 0)
                 what += (what.Length > 0 ? " + " : "") + $"{batch.Count} item stack(s)";
-            AddLog(CurrentName, $"Opening trade for {what}.");
+            AddLog(CurrentName, what.Length > 0
+                ? $"Opening trade for {what}."
+                : "Opening a trade to collect.");
             Goto(SweepState.WaitTradeOpen, cfg.TradeTimeout);
         }
     }
@@ -1002,6 +1053,9 @@ public class Sweeper
     // was refused.
     private const int TradeRequestGraceSeconds = 15;
     private DateTime tradeRequestedAt = DateTime.MinValue;
+
+    // Whether this character has already opened its one empty collection trade.
+    private bool collectRequested;
 
     private void DoWaitTradeOpen()
     {
@@ -1088,7 +1142,7 @@ public class Sweeper
     // handout too big for one window needs us here for the second.
     private void DoneSending()
     {
-        if (cfg.CombinedMode && cfg.DispenseWaitSeconds > 0)
+        if (Collecting && cfg.DispenseWaitSeconds > 0)
         {
             dispenseUntil = DateTime.Now.AddSeconds(cfg.DispenseWaitSeconds);
             dispenseCeiling = DateTime.Now.AddSeconds(cfg.DispenseWaitSeconds * 6 + 120);
@@ -1251,7 +1305,19 @@ public class Sweeper
 
     private void DoWaitTradeClose()
     {
-        if (TradeEngine.IsTradeOpen) return;
+        if (TradeEngine.IsTradeOpen)
+        {
+            // In a collecting run the receiver puts its handout in AFTER we've
+            // locked, and any change to either offer clears both locks. Waiting for
+            // a close that can't happen until we lock again is a hang, so keep
+            // confirming until the window actually goes.
+            if (Collecting)
+            {
+                if (TradeEngine.ConfirmTradeYesno(cfg.NoOp)) return;
+                TradeEngine.ConfirmTrade(cfg.NoOp);
+            }
+            return;
+        }
 
         if (cfg.NoOp)
         {
@@ -1649,6 +1715,7 @@ public class Sweeper
         dispenseUntil = DateTime.MinValue;
         dispenseCeiling = DateTime.MinValue;
         tradeRequestedAt = DateTime.MinValue;
+        collectRequested = false;
         gilToSend = 0;
         thisTrade = 0;
         moveIssued = false;
@@ -1676,7 +1743,9 @@ public class Sweeper
                 catch (Exception ex) { Plugin.Log.Warning($"Couldn't clear run state: {ex.Message}"); }
             }
 
-            var summary = $"Sweep complete. {totalSent:N0} gil moved to {cfg.MainFull}.";
+            var summary = CollectRun
+                ? $"Collection run complete. {Queue.Count} character(s) visited {cfg.MainFull}."
+                : $"Sweep complete. {totalSent:N0} gil moved to {cfg.MainFull}.";
             if (requeues.Count > 0)
                 summary += $" {requeues.Count} character(s) had to be retried " +
                            "because the receiver was busy.";

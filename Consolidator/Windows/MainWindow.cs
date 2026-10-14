@@ -50,8 +50,8 @@ public class MainWindow : Window, IDisposable
 
         DrawTab("Run", DrawRunTab);
         DrawTab("Characters", DrawCharactersTab);
-        DrawTab("Send", DrawSendTab);
-        DrawTab("Dispenser", DrawDispenserTab);
+        DrawTab("Give away", DrawSendTab);
+        DrawTab("Hand out", DrawDispenserTab);
         DrawTab("Settings", DrawSettingsTab);
         DrawTab("Log", DrawLogTab);
     }
@@ -91,7 +91,8 @@ public class MainWindow : Window, IDisposable
         else if (Sweep.Running)
         {
             ImGui.TextColored(ImGuiColors.DalamudYellow,
-                $"  {Sweep.State}  ({Sweep.Index + 1}/{Sweep.Queue.Count})");
+                (Sweep.CollectRun ? "  Collecting \u2014 " : "  ")
+                + $"{Sweep.State}  ({Sweep.Index + 1}/{Sweep.Queue.Count})");
         }
         else
         {
@@ -124,60 +125,167 @@ public class MainWindow : Window, IDisposable
 
     // ---------------- run ----------------
 
+    // Which half of the operation this client is doing. Derived, not configured:
+    // if you're logged in as the receiving character you're the one handing out,
+    // and otherwise you're the one driving alts. Everything on this tab is labelled
+    // against it so it's obvious which controls belong on which client.
+    private enum ClientRole { Unknown, Receiver, Alt }
+
+    private ClientRole Role =>
+        !Player.Available ? ClientRole.Unknown
+        : Disp.OnDispensingCharacter ? ClientRole.Receiver
+        : ClientRole.Alt;
+
     private void DrawRunTab()
     {
         ImGui.Spacing();
 
-        // Offer to pick up an interrupted run before anything else.
-        if (Sweep.CanResume)
+        DrawResumeBanner();
+        DrawRoleHeader();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        DrawAltControls();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        DrawReceiverControls();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.TextUnformatted("Recent:");
+
+        var h = Math.Max(110f, ImGui.GetContentRegionAvail().Y);
+        using (var log = ImRaii.Child("##recentlog", new Vector2(-1, h), true))
         {
-            var run = Cfg.Run;
-            var next = run.Index < run.Queue.Count ? run.Queue[run.Index].Full : "?";
+            if (log)
+            {
+                foreach (var line in Sweep.Log)
+                    DrawLogLine(line);
 
-            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
-            ImGui.TextColored(ImGuiColors.DalamudOrange,
-                $"An earlier run was interrupted on {run.SavedAt:MMM d, HH:mm}.");
-            ImGui.TextUnformatted(
-                $"{run.Index} of {run.Queue.Count} done, {run.TotalSent:N0} gil moved. " +
-                $"Next up: {next}.");
-            ImGui.PopTextWrapPos();
-
-            ImGui.Spacing();
-            if (ImGui.Button("Resume that run", new Vector2(150, 26)))
-                Sweep.ResumeInterrupted();
-            ImGui.SameLine();
-            if (ImGui.Button("Discard", new Vector2(90, 26)))
-                Sweep.DiscardInterrupted();
-
-            ImGui.Spacing();
-            ImGui.Separator();
-            ImGui.Spacing();
+                // Stick to the bottom while running, unless the user scrolled up.
+                if (Sweep.Running && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 40)
+                    ImGui.SetScrollHereY(1.0f);
+            }
         }
+    }
+
+    // Offer to pick up an interrupted run before anything else.
+    private void DrawResumeBanner()
+    {
+        if (!Sweep.CanResume) return;
+
+        var run = Cfg.Run;
+        var next = run.Index < run.Queue.Count ? run.Queue[run.Index].Full : "?";
+
+        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ImGuiColors.DalamudOrange,
+            $"An earlier {(run.Collect ? "collection run" : "sweep")} was interrupted "
+            + $"on {run.SavedAt:MMM d, HH:mm}.");
+        ImGui.TextUnformatted(
+            $"{run.Index} of {run.Queue.Count} done, {run.TotalSent:N0} gil moved. " +
+            $"Next up: {next}.");
+        ImGui.PopTextWrapPos();
+
+        ImGui.Spacing();
+        if (ImGui.Button("Resume that run", new Vector2(150, 26)))
+            Sweep.ResumeInterrupted();
+        ImGui.SameLine();
+        if (ImGui.Button("Discard", new Vector2(90, 26)))
+            Sweep.DiscardInterrupted();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+    }
+
+    private void DrawRoleHeader()
+    {
+        var role = Role;
+
+        ImGui.TextUnformatted("This client:");
+        ImGui.SameLine();
+
+        if (role == ClientRole.Receiver)
+            ImGui.TextColored(ImGuiColors.HealerGreen,
+                $"{TradeEngine.PlayerFull} — the receiving character");
+        else if (role == ClientRole.Alt)
+            ImGui.TextColored(ImGuiColors.DalamudYellow,
+                $"{TradeEngine.PlayerFull} — an alt");
+        else
+            ImGui.TextColored(ImGuiColors.DalamudGrey, "not logged in");
+
+        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ImGuiColors.DalamudGrey, role switch
+        {
+            ClientRole.Receiver =>
+                "Stay parked. Alts come to you — this client hands things out and answers "
+                + "their trades.",
+            ClientRole.Alt =>
+                "This client does the moving: logging each alt in, travelling, and walking "
+                + "them to the receiving character.",
+            _ => "Log in and this will say which half of the job this client is doing.",
+        });
+        ImGui.PopTextWrapPos();
+    }
+
+    private static void SectionHeader(string title, bool here, string elsewhere)
+    {
+        ImGui.TextColored(here ? ImGuiColors.DalamudViolet : ImGuiColors.DalamudGrey, title);
+        ImGui.SameLine();
+        ImGui.TextColored(here ? ImGuiColors.HealerGreen : ImGuiColors.DalamudGrey,
+            here ? "— this client" : elsewhere);
+    }
+
+    // ---- the alt-driving half ----
+
+    private void DrawAltControls()
+    {
+        SectionHeader("Running your alts", Role == ClientRole.Alt,
+            "— belongs on the client cycling your alts");
+        ImGui.Spacing();
 
         var err = Sweep.Validate();
-        if (err != null && !Sweep.Running)
-        {
-            ImGui.TextColored(ImGuiColors.DalamudRed, err);
-            ImGui.Spacing();
-        }
+        var collectErr = Sweep.Validate(true);
 
         using (ImRaii.Disabled(Sweep.Running || err != null))
         {
-            if (ImGui.Button(Cfg.NoOp ? "Start (dry run)" : "Start sweep", new Vector2(160, 30)))
+            if (ImGui.Button(Cfg.NoOp ? "Start (dry run)" : "Start sweep", new Vector2(150, 30)))
                 Sweep.Start();
         }
+        ImGuiComponents.HelpMarker(
+            "Walks each alt to the receiving character and hands over whatever is ticked\n" +
+            "on the Give away tab.");
 
         ImGui.SameLine();
+        using (ImRaii.Disabled(Sweep.Running || collectErr != null))
+        {
+            if (ImGui.Button("Send to collect", new Vector2(150, 30)))
+                Sweep.Start(collect: true);
+        }
+        ImGuiComponents.HelpMarker(
+            "The other direction: walks each alt to the receiving character and waits\n" +
+            "there to be given something, rather than to drop anything off.\n\n" +
+            "Run this while your other client is dispensing. Same queue, same order,\n" +
+            "same crash protection as a sweep — it just doesn't need anybody to have\n" +
+            "something worth sending, so nobody is skipped for being empty.\n\n" +
+            "Anything still ticked on Give away goes along while they're there, so untick\n" +
+            "gil first if you want a pure collection run.");
+
         using (ImRaii.Disabled(!Sweep.Running))
         {
             if (Sweep.Paused)
             {
-                if (ImGui.Button("Resume", new Vector2(110, 30)))
+                if (ImGui.Button("Resume", new Vector2(110, 26)))
                     Sweep.Resume();
             }
             else
             {
-                if (ImGui.Button("Pause", new Vector2(110, 30)))
+                if (ImGui.Button("Pause", new Vector2(110, 26)))
                     Sweep.Pause();
             }
         }
@@ -188,14 +296,60 @@ public class MainWindow : Window, IDisposable
         ImGui.SameLine();
         using (ImRaii.Disabled(!Sweep.Running))
         {
-            if (ImGui.Button("Stop", new Vector2(100, 30)))
+            if (ImGui.Button("Stop", new Vector2(100, 26)))
                 Sweep.Stop();
         }
 
-        ImGui.Spacing();
-        ImGui.Separator();
+        if (!Sweep.Running && (err != null || collectErr != null))
+        {
+            ImGui.Spacing();
+            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+            if (err != null)
+                ImGui.TextColored(ImGuiColors.DalamudRed, $"Sweep: {err}");
+            if (collectErr != null)
+                ImGui.TextColored(ImGuiColors.DalamudOrange, $"Collect: {collectErr}");
+            ImGui.PopTextWrapPos();
+        }
+
         ImGui.Spacing();
 
+        // Lives here rather than with the handout settings: it configures THIS
+        // client's runs, not the receiving character's stock.
+        if (ImGui.Checkbox("Wait for a handout on every visit", ref Cfg.CombinedMode))
+            Cfg.Save();
+        ImGuiComponents.HelpMarker(
+            "With this on, an alt that has finished handing over its gil waits at the\n" +
+            "receiver instead of leaving straight away, and accepts trades the receiver\n" +
+            "opens — so gil goes up and a handout comes down in the same visit.\n\n" +
+            "Leave it off and a sweep behaves exactly as it always has.\n\n" +
+            "A collection run waits regardless; this is for ordinary sweeps.");
+
+        if (Cfg.CombinedMode)
+        {
+            ImGui.Indent();
+            ImGui.SetNextItemWidth(160);
+            var wait = Cfg.DispenseWaitSeconds;
+            if (ImGui.InputInt("Wait at the receiver (seconds)", ref wait, 5, 15))
+            {
+                Cfg.DispenseWaitSeconds = Math.Clamp(wait, 0, 600);
+                Cfg.Save();
+            }
+            ImGuiComponents.HelpMarker(
+                "The clock restarts every time a trade happens, so a handout that needs\n" +
+                "several windows won't be cut off halfway. 0 disables the wait.");
+
+            if (Cfg.DispenseWaitSeconds <= 0)
+                ImGui.TextColored(ImGuiColors.DalamudOrange,
+                    "Set above 0, or alts leave before anything can be handed to them.");
+            ImGui.Unindent();
+        }
+
+        ImGui.Spacing();
+        DrawQueueSummary();
+    }
+
+    private void DrawQueueSummary()
+    {
         var enabled = Cfg.Characters.Count(c => c.Enabled);
         var gil = Cfg.Items.FirstOrDefault(i => i.IsGil);
 
@@ -214,8 +368,10 @@ public class MainWindow : Window, IDisposable
                 ImGui.TextColored(ImGuiColors.DalamudGrey,
                     $"  {skippable} will be skipped without logging in (already at/below the floor).");
         }
+
         ImGui.TextUnformatted($"Receiving: {(string.IsNullOrWhiteSpace(Cfg.MainName) ? "(not set)" : Cfg.MainFull)}");
-        ImGui.TextUnformatted($"Destination: {Cfg.TargetWorld} \u2192 \"{Cfg.Destination}\"");
+        ImGui.TextUnformatted($"Destination: {Cfg.TargetWorld} → \"{Cfg.Destination}\"");
+
         if (gil != null && gil.Enabled)
             ImGui.TextUnformatted($"Gil: send all, keeping {gil.KeepAmount:N0} per character");
 
@@ -227,26 +383,72 @@ public class MainWindow : Window, IDisposable
                 "  Item trading is unavailable — only gil will be sent.");
 
         ImGui.Spacing();
+        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
         ImGui.TextColored(ImGuiColors.DalamudGrey,
-            "The receiving character must be logged in on another client with\n" +
-            "Dropbox active so it auto-accepts the incoming trades.");
+            Cfg.DispenseAcceptRequests
+                ? "The receiving character must be logged in on another client with "
+                  + "Consolidator dispensing, which accepts the trades itself. Dropbox must "
+                  + "be OFF over there."
+                : "The receiving character must be logged in on another client with Dropbox "
+                  + "active so it auto-accepts the incoming trades.");
+        ImGui.PopTextWrapPos();
+    }
+
+    // ---- the handing-out half ----
+
+    private void DrawReceiverControls()
+    {
+        SectionHeader("Handing out", Role == ClientRole.Receiver,
+            "— belongs on the receiving character");
+        ImGui.Spacing();
+
+        var err = Disp.Validate();
+
+        using (ImRaii.Disabled(Disp.Running || err != null))
+        {
+            if (ImGui.Button("Start dispensing", new Vector2(160, 30)))
+                Disp.Start();
+        }
+        ImGuiComponents.HelpMarker(
+            "Hands a fixed amount to every character on the Characters list that trades\n" +
+            "this one. Set up what goes out on the Hand out tab.");
+
+        ImGui.SameLine();
+        using (ImRaii.Disabled(!Disp.Running))
+        {
+            if (ImGui.Button("Stop##dispstop", new Vector2(100, 30)))
+                Disp.Stop();
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Reset ledger", new Vector2(130, 30)))
+            Disp.ResetLedger();
+        ImGuiComponents.HelpMarker(
+            "Forgets who has already had their handout, so everyone is due one again.\n" +
+            "Per session — it isn't saved between game restarts.");
 
         ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.TextUnformatted("Recent:");
 
-        using (var log = ImRaii.Child("##recentlog", new Vector2(-1, -1), true))
+        if (err != null)
         {
-            if (log)
-            {
-                foreach (var line in Sweep.Log)
-                    DrawLogLine(line);
-
-                // Stick to the bottom while running, unless the user scrolled up.
-                if (Sweep.Running && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 40)
-                    ImGui.SetScrollHereY(1.0f);
-            }
+            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+            ImGui.TextColored(ImGuiColors.DalamudOrange, err);
+            ImGui.PopTextWrapPos();
+            return;
         }
+
+        var handouts = Cfg.DispenseItems
+            .Where(i => i.Enabled && i.ItemId != 0 && i.Amount > 0)
+            .Select(i => $"{i.Amount:N0}x {i.Label}")
+            .ToList();
+
+        ImGui.TextUnformatted($"Handing out: {string.Join(", ", handouts)}");
+        ImGui.TextUnformatted(
+            $"Served: {Disp.ServedCount} of {Cfg.Characters.Count(c => c.Enabled)}");
+
+        if (Disp.Running && Role != ClientRole.Receiver)
+            ImGui.TextColored(ImGuiColors.DalamudGrey,
+                $"Armed, but idle until this client is {Cfg.MainFull}.");
     }
 
     // ---------------- characters ----------------
@@ -1227,8 +1429,8 @@ public class MainWindow : Window, IDisposable
         ImGui.Spacing();
         ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
         ImGui.TextColored(ImGuiColors.DalamudGrey,
-            "What each character hands over. Anything above the Keep amount is traded; "
-            + "the rest stays with them.");
+            "Alts \u2192 receiving character. Anything above the Keep amount is traded; the "
+            + "rest stays with them.");
         ImGui.PopTextWrapPos();
 
         ImGui.Spacing();
@@ -1339,14 +1541,17 @@ public class MainWindow : Window, IDisposable
         ImGui.Spacing();
         ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
         ImGui.TextColored(ImGuiColors.DalamudGrey,
-            "The other direction: the receiving character hands a fixed amount to every "
-            + "character on the Characters list that trades them. Run this on the client "
-            + "logged in as the receiver — only that side can put its own items into the "
-            + "trade window.");
+            "Receiving character \u2192 alts. A fixed amount goes to every character on the "
+            + "Characters list that trades them. It runs on the client logged in as the "
+            + "receiver, because only that side can put its own items into the trade "
+            + "window.");
         ImGui.PopTextWrapPos();
 
         ImGui.Spacing();
         ImGui.Separator();
+        ImGui.Spacing();
+
+        StartsOnRunTab();
         ImGui.Spacing();
 
         DrawDispenseStatus();
@@ -1414,25 +1619,6 @@ public class MainWindow : Window, IDisposable
         var onChar = Disp.OnDispensingCharacter;
         var err = Disp.Validate();
 
-        using (ImRaii.Disabled(Disp.Running || err != null))
-        {
-            if (ImGui.Button("Start dispensing")) Disp.Start();
-        }
-
-        ImGui.SameLine();
-        using (ImRaii.Disabled(!Disp.Running))
-        {
-            if (ImGui.Button("Stop")) Disp.Stop();
-        }
-
-        ImGui.SameLine();
-        if (ImGui.Button("Reset ledger")) Disp.ResetLedger();
-        ImGuiComponents.HelpMarker(
-            "Forgets who has already been given their handout, so everyone is due one\n" +
-            "again. The ledger is per session — it isn't saved between game restarts.");
-
-        ImGui.Spacing();
-
         if (err != null)
         {
             ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
@@ -1482,6 +1668,12 @@ public class MainWindow : Window, IDisposable
             ImGui.SameLine();
             ImGui.TextColored(ImGuiColors.DalamudGrey, $"With {Disp.Partner}.");
         }
+    }
+
+    private static void StartsOnRunTab()
+    {
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            "Set up what goes out here; start and stop it on the Run tab.");
     }
 
     private void DrawDispenseItems()
@@ -1728,62 +1920,14 @@ public class MainWindow : Window, IDisposable
             "of their handout. Only five stacks fit in one window, so anything larger\n" +
             "needs this. 0 turns follow-ups off entirely.");
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        ImGui.TextColored(ImGuiColors.DalamudViolet, "Combined mode (sweep + dispense)");
-        ImGui.Spacing();
-
-        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
-        ImGui.TextColored(ImGuiColors.DalamudGrey,
-            "This half runs on the SWEEPING client, not this one. With it on, an alt that "
-            + "has finished handing over its gil waits at the receiver instead of leaving "
-            + "straight away, and accepts trades the receiver opens — so gil goes up and "
-            + "the handout comes down in the same visit.");
-        ImGui.PopTextWrapPos();
-
-        ImGui.Spacing();
-
-        if (ImGui.Checkbox("Collect a handout while sweeping", ref Cfg.CombinedMode))
-            Cfg.Save();
-        ImGuiComponents.HelpMarker(
-            "Set this in the Consolidator running your alts. It has no effect on the\n" +
-            "dispensing character itself.\n\n" +
-            "Off: a sweep hands over gil and goes home, exactly as before.");
-
-        if (Cfg.CombinedMode)
-        {
-            ImGui.Indent();
-            ImGui.SetNextItemWidth(160);
-            var wait = Cfg.DispenseWaitSeconds;
-            if (ImGui.InputInt("Wait at the receiver (seconds)", ref wait, 5, 15))
-            {
-                Cfg.DispenseWaitSeconds = Math.Clamp(wait, 0, 600);
-                Cfg.Save();
-            }
-            ImGuiComponents.HelpMarker(
-                "How long each alt lingers after sending, waiting for the handout. The\n" +
-                "clock restarts every time a trade happens, so a multi-window handout\n" +
-                "won't be cut off halfway. 0 disables the wait.");
-
-            if (Cfg.DispenseWaitSeconds <= 0)
-            {
-                ImGui.TextColored(ImGuiColors.DalamudOrange,
-                    "Set above 0, or alts will leave before anything can be handed to them.");
-            }
-            ImGui.Unindent();
-        }
     }
 
     private void DrawDispenseProgress()
     {
-        ImGui.TextColored(ImGuiColors.DalamudViolet, "Who's had theirs");
-        ImGui.SameLine();
-
         var enabled = Cfg.Characters.Where(c => c.Enabled).ToList();
-        ImGui.TextColored(ImGuiColors.DalamudGrey,
-            $"({Disp.ServedCount} of {enabled.Count} done)");
+
+        if (!ImGui.CollapsingHeader($"Who's had theirs ({Disp.ServedCount} of {enabled.Count} done)"))
+            return;
 
         ImGui.Spacing();
 
@@ -1796,57 +1940,39 @@ public class MainWindow : Window, IDisposable
 
         var live = Cfg.DispenseItems.Where(i => i.Enabled && i.ItemId != 0 && i.Amount > 0).ToList();
 
-        var reserved = ImGui.GetTextLineHeightWithSpacing() * 8;
-        var avail = Math.Max(100f, ImGui.GetContentRegionAvail().Y - reserved);
+        var h = Math.Max(120f, ImGui.GetContentRegionAvail().Y);
 
-        using (var table = ImRaii.Table("##givenlog", 3,
+        using var table = ImRaii.Table("##givenlog", 3,
             ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY,
-            new Vector2(-1, avail)))
+            new Vector2(-1, h));
+        if (!table) return;
+
+        ImGui.TableSetupColumn("Character", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("Given", ImGuiTableColumnFlags.WidthFixed, 160);
+        ImGui.TableSetupColumn("Still owed", ImGuiTableColumnFlags.WidthFixed, 110);
+        ImGui.TableSetupScrollFreeze(0, 1);
+        ImGui.TableHeadersRow();
+
+        foreach (var c in enabled)
         {
-            if (table)
-            {
-                ImGui.TableSetupColumn("Character", ImGuiTableColumnFlags.WidthStretch);
-                ImGui.TableSetupColumn("Given", ImGuiTableColumnFlags.WidthFixed, 160);
-                ImGui.TableSetupColumn("Still owed", ImGuiTableColumnFlags.WidthFixed, 110);
-                ImGui.TableSetupScrollFreeze(0, 1);
-                ImGui.TableHeadersRow();
+            ImGui.TableNextRow();
 
-                foreach (var c in enabled)
-                {
-                    ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            ImGui.TextUnformatted(c.Full);
 
-                    ImGui.TableNextColumn();
-                    ImGui.TextUnformatted(c.Full);
+            ImGui.TableNextColumn();
+            var parts = live.Select(i => $"{Disp.GivenTo(c.Full, i):N0} {i.Label}").ToList();
+            ImGui.TextColored(ImGuiColors.DalamudGrey,
+                parts.Count == 0 ? "—" : string.Join(", ", parts));
 
-                    ImGui.TableNextColumn();
-                    var parts = live.Select(i => $"{Disp.GivenTo(c.Full, i):N0} {i.Label}").ToList();
-                    ImGui.TextColored(ImGuiColors.DalamudGrey,
-                        parts.Count == 0 ? "—" : string.Join(", ", parts));
-
-                    ImGui.TableNextColumn();
-                    var owed = Disp.OwedTo(c.Full);
-                    if (live.Count == 0)
-                        ImGui.TextColored(ImGuiColors.DalamudGrey, "—");
-                    else if (owed == 0)
-                        ImGui.TextColored(ImGuiColors.HealerGreen, "done");
-                    else
-                        ImGui.TextColored(ImGuiColors.DalamudOrange, $"{owed:N0}");
-                }
-            }
-        }
-
-        ImGui.Spacing();
-        if (ImGui.SmallButton("Clear dispenser log")) Disp.Log.Clear();
-
-        using (var log = ImRaii.Child("##displog", new Vector2(-1, -1), true))
-        {
-            if (log)
-            {
-                foreach (var line in Disp.Log) DrawLogLine(line);
-
-                if (Disp.Running && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 40)
-                    ImGui.SetScrollHereY(1.0f);
-            }
+            ImGui.TableNextColumn();
+            var owed = Disp.OwedTo(c.Full);
+            if (live.Count == 0)
+                ImGui.TextColored(ImGuiColors.DalamudGrey, "—");
+            else if (owed == 0)
+                ImGui.TextColored(ImGuiColors.HealerGreen, "done");
+            else
+                ImGui.TextColored(ImGuiColors.DalamudOrange, $"{owed:N0}");
         }
     }
 
@@ -1855,17 +1981,37 @@ public class MainWindow : Window, IDisposable
     private void DrawLogTab()
     {
         ImGui.Spacing();
-        if (ImGui.SmallButton("Clear")) Sweep.Log.Clear();
+        if (ImGui.SmallButton("Clear both")) { Sweep.Log.Clear(); Disp.Log.Clear(); }
         ImGui.Spacing();
 
-        using var child = ImRaii.Child("##log", new Vector2(-1, -1), true);
-        if (!child) return;
+        // Two panes rather than one interleaved list: on any given client only one
+        // of them is doing anything, and mixing them would make it look like this
+        // client was doing both halves.
+        var spare = ImGui.GetContentRegionAvail().Y - ImGui.GetTextLineHeightWithSpacing() * 4;
+        var half = Math.Max(110f, spare / 2);
 
-        foreach (var line in Sweep.Log)
-            DrawLogLine(line);
+        ImGui.TextColored(ImGuiColors.DalamudViolet, "Running your alts");
+        using (var a = ImRaii.Child("##log", new Vector2(-1, half), true))
+        {
+            if (a)
+            {
+                foreach (var line in Sweep.Log) DrawLogLine(line);
+                if (Sweep.Running && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 40)
+                    ImGui.SetScrollHereY(1.0f);
+            }
+        }
 
-        if (Sweep.Running && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 40)
-            ImGui.SetScrollHereY(1.0f);
+        ImGui.Spacing();
+        ImGui.TextColored(ImGuiColors.DalamudViolet, "Handing out");
+        using (var b = ImRaii.Child("##displog", new Vector2(-1, -1), true))
+        {
+            if (b)
+            {
+                foreach (var line in Disp.Log) DrawLogLine(line);
+                if (Disp.Running && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 40)
+                    ImGui.SetScrollHereY(1.0f);
+            }
+        }
     }
 
     private static void DrawLogLine(SweepLogLine l)

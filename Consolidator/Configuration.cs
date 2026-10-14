@@ -89,6 +89,7 @@ public class RunState
     public List<ulong> Completed = new();     // CIDs finished cleanly
     public List<string> CompletedNames = new();
     public long TotalSent;                    // gil confirmed moved so far
+    public bool Collect;                      // was this a collection run?
 
     public void Clear()
     {
@@ -98,6 +99,7 @@ public class RunState
         Completed.Clear();
         CompletedNames.Clear();
         TotalSent = 0;
+        Collect = false;
     }
 }
 
