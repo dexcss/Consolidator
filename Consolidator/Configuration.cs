@@ -63,10 +63,18 @@ public class DispenseItem
 {
     public uint ItemId;
     public string Label = "";
-    public long Amount;          // how many each character receives
+    public long Amount;          // how many each character receives, or is brought up to
     public long Reserve;         // stock that never leaves, however much is owed
     public bool Hq;
     public bool Enabled = true;
+
+    // Treat Amount as a target rather than a quantity: bring each character UP TO
+    // Amount, counting what they already hold, instead of handing over Amount flat.
+    //
+    // Only possible for the two items AutoRetainer records per character (submarine
+    // fuel and repair kits). Nothing else has a readable count from the receiving
+    // character's side, because you cannot see another player's bags.
+    public bool TopUp;
 }
 
 // A run that was interrupted (crash, force-quit, /xlplugins reload). Persisted so

@@ -82,6 +82,11 @@ public class Dispenser
     private bool ignoringWindow;
     private bool warnedUnknown;
 
+    // What AutoRetainer last recorded each character as holding, read once per
+    // character per session. Looked up on the receiving client, which cannot see an
+    // alt's bags itself — AR's cache is the only readable source.
+    private readonly Dictionary<string, ArCharInfo?> theirStock = new();
+
     // When each character was last turned away, so a waiting alt retrying every
     // few seconds doesn't fill the log with the same line.
     private readonly Dictionary<string, DateTime> declinedAt = new();
@@ -130,9 +135,82 @@ public class Dispenser
         => given.TryGetValue((full, it.ItemId, it.Hq), out var v) ? v : 0;
 
     public long OwedTo(string full)
-        => abandoned.Contains(full)
-            ? 0
-            : Handouts.Sum(i => Math.Max(0, i.Amount - GivenTo(full, i)));
+    {
+        if (abandoned.Contains(full)) return 0;
+
+        long total = 0;
+        foreach (var it in Handouts)
+        {
+            if (TryWanted(full, it, out var want, out _)) total += want;
+        }
+        return total;
+    }
+
+    // AutoRetainer's record for a character, cached for the session. Null when it
+    // has nothing for them — a hand-added row with no CID, or a character AR has
+    // never visited.
+    private ArCharInfo? StockFor(string full)
+    {
+        if (theirStock.TryGetValue(full, out var hit)) return hit;
+
+        ArCharInfo? info = null;
+        var row = cfg.Characters.FirstOrDefault(c =>
+            string.Equals(c.Full, full, StringComparison.OrdinalIgnoreCase));
+
+        if (row != null && row.Cid != 0)
+            info = PluginIpc.GetArCharInfo(row.Cid);
+
+        theirStock[full] = info;
+        return info;
+    }
+
+    // How much of one handout this character still needs.
+    //
+    // Flat mode is just "the amount, less whatever we've already handed them".
+    // Top-up mode subtracts what they already hold as well, so 2,997 repair kits
+    // against a character holding 300 comes out as 2,697.
+    //
+    // Returns false when top-up is on but there's no figure to work from. That
+    // deliberately gives nothing rather than guessing: handing over a full 2,997 to
+    // somebody who already had 2,900 wastes the lot and can't be undone, whereas
+    // giving too little is fixed by running again.
+    private bool TryWanted(string full, DispenseItem it, out long want, out string why)
+    {
+        why = "";
+        want = Math.Max(0, it.Amount - GivenTo(full, it));
+
+        if (!it.TopUp) return true;
+
+        var info = StockFor(full);
+
+        if (info == null)
+        {
+            why = $"{it.Label}: AutoRetainer has no record for this character, so "
+                + "there's no way to tell what they're already holding.";
+            want = 0;
+            return false;
+        }
+
+        if (!info.HasStockFor(it.ItemId))
+        {
+            why = $"{it.Label}: AutoRetainer only tracks fuel and repair kits, so "
+                + "topping up isn't possible for this item.";
+            want = 0;
+            return false;
+        }
+
+        want = Math.Max(0, it.Amount - info.StockOf(it.ItemId) - GivenTo(full, it));
+        return true;
+    }
+
+    // Why this character can't be topped up, or "" if they can. A blocked character
+    // is NOT the same as a finished one, and must not be reported as served.
+    public string BlockedReason(string full)
+    {
+        foreach (var it in Handouts)
+            if (!TryWanted(full, it, out _, out var why)) return why;
+        return "";
+    }
 
     // What's actually spendable right now: what's in the bags, less the reserve.
     public long AvailableOf(DispenseItem it)
@@ -154,8 +232,25 @@ public class Dispenser
         return "";
     }
 
-    // Enough for one more character to be served in full?
-    public string ShortfallForNext() => Shortfall(i => i.Amount);
+    // Enough for the next character to be served in full?
+    //
+    // The biggest outstanding need across everyone still due something, not a flat
+    // handout: under top-up the next character may only need a fraction of Amount,
+    // and demanding the full figure in stock would raise the refill banner for a
+    // shortage that isn't real.
+    public string ShortfallForNext()
+    {
+        var pending = PendingTargets();
+        if (pending.Count == 0) return "";
+
+        return Shortfall(it =>
+        {
+            long most = 0;
+            foreach (var full in pending)
+                if (TryWanted(full, it, out var w, out _) && w > most) most = w;
+            return most;
+        });
+    }
 
     // Out of stock AND set to turn people away rather than use up their visit.
     public bool TurningTradesAway => NeedsRefill && cfg.DispenseDeclineWhenOut;
@@ -206,7 +301,10 @@ public class Dispenser
 
     public int ServedCount =>
         cfg.Characters.Where(c => c.Enabled)
-           .Count(c => Handouts.Any() && OwedTo(c.Full) == 0 && !abandoned.Contains(c.Full));
+           .Count(c => Handouts.Any()
+                       && OwedTo(c.Full) == 0
+                       && !abandoned.Contains(c.Full)
+                       && BlockedReason(c.Full).Length == 0);
 
     // ---------- control ----------
 
@@ -271,6 +369,7 @@ public class Dispenser
         abandoned.Clear();
         strikes.Clear();
         declinedAt.Clear();
+        theirStock.Clear();
         AddLog("", "Ledger cleared — everyone is owed their handout again.");
     }
 
@@ -414,16 +513,23 @@ public class Dispenser
 
         if (!cfg.DispenseAcceptRequests) return;
 
-        var targets = PendingTargets();
-        if (targets.Count == 0) return;
+        // Everyone on the list, not just those still owed something. A character
+        // who has already had their handout may still be coming to hand gil over,
+        // and with Dropbox off this is the only thing that can accept it — leaving
+        // them out meant their trade was never answered at all.
+        var allow = Whitelist.ToList();
+        if (allow.Count == 0) return;
 
-        var from = TradeEngine.IncomingTradeRequest(targets);
+        var from = TradeEngine.IncomingTradeRequest(allow);
         if (string.IsNullOrEmpty(from)) return;
 
         // Out of stock and set to turn people away. Say no rather than take their
         // gil and send them off still owed — a declined trade moves nothing, which
         // is what keeps a sweeping alt waiting here instead of going home.
-        if (TurningTradesAway)
+        //
+        // Only for people we actually owe: someone already served has nothing to
+        // wait for, so turning them away would strand them for no reason.
+        if (TurningTradesAway && OwedTo(from) > 0)
         {
             if (!TradeEngine.DeclineTradeRequest()) return;
 
@@ -505,9 +611,14 @@ public class Dispenser
         var owed = OwedTo(Partner);
         if (owed <= 0)
         {
-            AddLog(Partner, abandoned.Contains(Partner)
-                ? "Given up on this one earlier — accepting the trade, dispensing nothing."
-                : "Already had their handout — accepting the trade, dispensing nothing.");
+            var blocked = BlockedReason(Partner);
+            AddLog(Partner,
+                blocked.Length > 0
+                    ? blocked + " Taking the trade, dispensing nothing."
+                    : abandoned.Contains(Partner)
+                        ? "Given up on this one earlier — accepting the trade, dispensing nothing."
+                        : "Already had their handout — accepting the trade, dispensing nothing.",
+                blocked.Length > 0);
             Goto(DispenseState.Confirm, 120);
             return;
         }
@@ -518,7 +629,7 @@ public class Dispenser
         // keeps the ledger meaning one simple thing.
         if (cfg.DispenseStopWhenOut)
         {
-            var short_ = Shortfall(i => Math.Max(0, i.Amount - GivenTo(Partner, i)));
+            var short_ = Shortfall(i => TryWanted(Partner, i, out var w, out _) ? w : 0);
             if (short_.Length > 0)
             {
                 RaiseRefill(short_);
@@ -549,7 +660,11 @@ public class Dispenser
         {
             if (plan.Count >= TradeEngine.MaxItemsPerTrade) break;
 
-            var want = it.Amount - GivenTo(Partner, it);
+            if (!TryWanted(Partner, it, out var want, out var why))
+            {
+                AddLog(Partner, why, true);
+                continue;
+            }
             if (want <= 0) continue;
 
             var slots = Inventory.PlanGive(it.ItemId, it.Hq, it.Label, want, it.Reserve,
@@ -664,7 +779,7 @@ public class Dispenser
 
             // Cap the credit at what was actually owed. Without this, stock leaving
             // for any other reason during the window would be recorded against them.
-            var owedThis = Math.Max(0, it.Amount - GivenTo(Partner, it));
+            var owedThis = TryWanted(Partner, it, out var w, out _) ? w : 0;
             var credit = Math.Min(delta, owedThis);
             if (credit <= 0) continue;
 

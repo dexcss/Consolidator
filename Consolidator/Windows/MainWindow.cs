@@ -1738,7 +1738,7 @@ public class MainWindow : Window, IDisposable
 
         DispenseItem? remove = null;
 
-        using (var table = ImRaii.Table("##giveitems", 7,
+        using (var table = ImRaii.Table("##giveitems", 8,
             ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
         {
             if (table)
@@ -1746,9 +1746,10 @@ public class MainWindow : Window, IDisposable
                 ImGui.TableSetupColumn("On", ImGuiTableColumnFlags.WidthFixed, 28);
                 ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch);
                 ImGui.TableSetupColumn("HQ", ImGuiTableColumnFlags.WidthFixed, 32);
-                ImGui.TableSetupColumn("Give each", ImGuiTableColumnFlags.WidthFixed, 120);
-                ImGui.TableSetupColumn("Reserve", ImGuiTableColumnFlags.WidthFixed, 120);
-                ImGui.TableSetupColumn("In bags", ImGuiTableColumnFlags.WidthFixed, 110);
+                ImGui.TableSetupColumn("Top up", ImGuiTableColumnFlags.WidthFixed, 52);
+                ImGui.TableSetupColumn("Amount", ImGuiTableColumnFlags.WidthFixed, 110);
+                ImGui.TableSetupColumn("Reserve", ImGuiTableColumnFlags.WidthFixed, 110);
+                ImGui.TableSetupColumn("In bags", ImGuiTableColumnFlags.WidthFixed, 100);
                 ImGui.TableSetupColumn("##grm", ImGuiTableColumnFlags.WidthFixed, 28);
                 ImGui.TableHeadersRow();
 
@@ -1767,6 +1768,41 @@ public class MainWindow : Window, IDisposable
                     var hq = it.Hq;
                     if (ImGui.Checkbox($"##ghq{it.ItemId}", ref hq)) { it.Hq = hq; Cfg.Save(); }
 
+                    // Top-up needs a readable count of what the other character is
+                    // already holding, and the only source for that is AutoRetainer's
+                    // cache — which records submarine fuel and repair kits, and
+                    // nothing else.
+                    ImGui.TableNextColumn();
+                    var trackable = it.ItemId == ArCharInfo.CeruleumTankItemId
+                                 || it.ItemId == ArCharInfo.RepairKitItemId;
+
+                    if (trackable)
+                    {
+                        var top = it.TopUp;
+                        if (ImGui.Checkbox($"##gtu{it.ItemId}", ref top))
+                        {
+                            it.TopUp = top;
+                            Cfg.Save();
+                        }
+                        if (ImGui.IsItemHovered())
+                            ImGui.SetTooltip(
+                                "On: bring each character UP TO the amount, counting what\n" +
+                                "they already hold. Off: hand over the amount flat.");
+                    }
+                    else
+                    {
+                        // Drawn as plain text rather than a disabled checkbox: a
+                        // disabled ImGui item reports no hover, so the explanation
+                        // for why it can't be ticked would never appear.
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, "\u2014");
+                        if (ImGui.IsItemHovered())
+                            ImGui.SetTooltip(
+                                "Only possible for Ceruleum Tanks and Magitek Repair Materials.\n" +
+                                "You can't see another player's bags, so the count has to come\n" +
+                                "from AutoRetainer \u2014 and those two are the only item counts\n" +
+                                "it keeps per character.");
+                    }
+
                     ImGui.TableNextColumn();
                     ImGui.SetNextItemWidth(-1);
                     var amount = (int)it.Amount;
@@ -1775,6 +1811,10 @@ public class MainWindow : Window, IDisposable
                         it.Amount = Math.Max(0, amount);
                         Cfg.Save();
                     }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(it.TopUp
+                            ? $"Bring each character up to {it.Amount:N0}."
+                            : $"Give each character {it.Amount:N0}.");
 
                     ImGui.TableNextColumn();
                     ImGui.SetNextItemWidth(-1);
@@ -1832,10 +1872,18 @@ public class MainWindow : Window, IDisposable
         ImGui.Spacing();
         ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
         ImGui.TextColored(ImGuiColors.DalamudGrey,
-            "Each enabled character gets \"Give each\" of every enabled item, once. "
-            + "Reserve is stock that never leaves, however much is owed. "
-            + "A trade window holds five stacks, so a larger amount is handed over "
-            + "across several windows while they're still standing there.");
+            "Each enabled character gets every enabled item, once. With Top up on, "
+            + "Amount is a target rather than a quantity \u2014 a character already "
+            + "holding 300 of 2,997 is handed 2,697. Reserve is stock that never "
+            + "leaves, however much is owed. A trade window holds five stacks, so a "
+            + "larger amount goes across several windows while they're still there.");
+
+        ImGui.Spacing();
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            "Top-up counts come from AutoRetainer, which records them when it visits "
+            + "a character to run submarines. They carry no timestamp, so there's no "
+            + "way to show how old a figure is \u2014 a character AutoRetainer hasn't "
+            + "been on since they last burned fuel will read high, and get too little.");
         ImGui.PopTextWrapPos();
     }
 
@@ -1967,8 +2015,15 @@ public class MainWindow : Window, IDisposable
 
             ImGui.TableNextColumn();
             var owed = Disp.OwedTo(c.Full);
+            var blocked = Disp.BlockedReason(c.Full);
+
             if (live.Count == 0)
                 ImGui.TextColored(ImGuiColors.DalamudGrey, "—");
+            else if (blocked.Length > 0)
+            {
+                ImGui.TextColored(ImGuiColors.DalamudRed, "no count");
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(blocked);
+            }
             else if (owed == 0)
                 ImGui.TextColored(ImGuiColors.HealerGreen, "done");
             else

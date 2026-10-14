@@ -26,6 +26,31 @@ public class ArCharInfo
     // without us visiting the character ourselves.
     public long Gil;
 
+    // Submarine fuel and repair kits, per character.
+    //
+    // These two exist because AutoRetainer needs them for voyages, and they are the
+    // ONLY item counts it keeps — OfflineCharacterData has `Ceruleum` (item 10155)
+    // and `RepairKits` (item 10373) and nothing else. Written by AR's
+    // WriteOfflineInventoryData on login/logout and periodically while it's working,
+    // so they're current as of its last visit to that character.
+    //
+    // There is no timestamp on them, so unlike gil we cannot tell how old a figure
+    // is. Anything depending on them has to be honest about that.
+    public long Ceruleum;
+    public long RepairKits;
+
+    public bool HasStockFor(uint itemId) =>
+        itemId == CeruleumTankItemId || itemId == RepairKitItemId;
+
+    public long StockOf(uint itemId) =>
+        itemId == CeruleumTankItemId ? Ceruleum
+        : itemId == RepairKitItemId ? RepairKits
+        : 0;
+
+    // The two item IDs AutoRetainer tracks per character.
+    public const uint CeruleumTankItemId = 10155;
+    public const uint RepairKitItemId = 10373;
+
     public bool InRetainersTab => Enabled && !ExcludeRetainer;
     public bool InDeployablesTab => WorkshopEnabled && !ExcludeWorkshop;
 }
@@ -106,6 +131,8 @@ public static class PluginIpc
                     WorkshopEnabled = JBool(data, "WorkshopEnabled"),
                     ExcludeWorkshop = JBool(data, "ExcludeWorkshop"),
                     Gil = JLong(data, "Gil"),
+                    Ceruleum = JLong(data, "Ceruleum"),
+                    RepairKits = JLong(data, "RepairKits"),
                 };
 
                 if (string.IsNullOrEmpty(info.Name) && string.IsNullOrEmpty(LastError))
@@ -128,6 +155,8 @@ public static class PluginIpc
                 WorkshopEnabled = GetBool(t, data, "WorkshopEnabled"),
                 ExcludeWorkshop = GetBool(t, data, "ExcludeWorkshop"),
                 Gil = GetLong(t, data, "Gil"),
+                Ceruleum = GetLong(t, data, "Ceruleum"),
+                RepairKits = GetLong(t, data, "RepairKits"),
             };
 
             if (string.IsNullOrEmpty(typed.Name) && string.IsNullOrEmpty(LastError))
