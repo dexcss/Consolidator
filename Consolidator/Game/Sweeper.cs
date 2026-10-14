@@ -26,6 +26,7 @@ public enum SweepState
     EnterItemQty,
     ConfirmTrade,
     WaitTradeClose,
+    WaitDispense,
     ReturnFc,
     WaitFc,
     WalkToDoor,
@@ -128,6 +129,9 @@ public class Sweeper
     private void ResetPerCharacter()
     {
         wrongCharWarned = false;
+        dispenseUntil = DateTime.MinValue;
+        dispenseCeiling = DateTime.MinValue;
+        tradeRequestedAt = DateTime.MinValue;
         gilToSend = 0;
         thisTrade = 0;
         charSent = 0;
@@ -537,6 +541,7 @@ public class Sweeper
             case SweepState.EnterItemQty: DoEnterItemQty(); break;
             case SweepState.ConfirmTrade: DoConfirmTrade(); break;
             case SweepState.WaitTradeClose: DoWaitTradeClose(); break;
+            case SweepState.WaitDispense: DoWaitDispense(); break;
             case SweepState.ReturnFc: DoReturnFc(); break;
             case SweepState.WaitFc: DoWaitFc(); break;
             case SweepState.WalkToDoor: DoWalkToDoor(); break;
@@ -759,15 +764,25 @@ public class Sweeper
 
         if (gilToSend <= 0 && items == 0)
         {
-            AddLog(CurrentName, "Nothing to send.");
-            Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
-            return;
+            // Normally there'd be no reason to walk over. In combined mode there
+            // is: they're still due a handout, and the receiver can only give it to
+            // someone standing in front of them.
+            if (!(cfg.CombinedMode && cfg.DispenseWaitSeconds > 0))
+            {
+                AddLog(CurrentName, "Nothing to send.");
+                Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
+                return;
+            }
+
+            AddLog(CurrentName, "Nothing to send — heading over anyway to collect.");
         }
 
         var sending = new List<string>();
         if (gilToSend > 0) sending.Add($"{gilToSend:N0} gil");
         if (items > 0) sending.Add($"{items:N0} item(s)");
-        AddLog(CurrentName, $"Found {cfg.MainFull}. Sending {string.Join(" + ", sending)}.");
+        AddLog(CurrentName, sending.Count > 0
+            ? $"Found {cfg.MainFull}. Sending {string.Join(" + ", sending)}."
+            : $"Found {cfg.MainFull}. Nothing to send.");
         moveIssued = false;
         Goto(SweepState.Approach, cfg.ApproachTimeout);
     }
@@ -834,8 +849,37 @@ public class Sweeper
         return true;
     }
 
+    // In combined mode the receiver hands things back, and anything bigger than one
+    // trade window means the receiver opens the follow-up. Answering that is what
+    // lets a multi-window handout finish before this character walks home.
+    //
+    // Only ever the configured receiver, and only when they're standing next to us.
+    private bool TryAcceptMainTrade()
+    {
+        if (!cfg.CombinedMode) return false;
+        if (TradeEngine.IsTradeOpen) return false;
+        if (string.IsNullOrWhiteSpace(cfg.MainFull)) return false;
+
+        var from = TradeEngine.IncomingTradeRequest(new[] { cfg.MainFull });
+        if (string.IsNullOrEmpty(from)) return false;
+        if (!TradeEngine.AcceptTradeRequest()) return false;
+
+        AddLog(CurrentName, $"Accepted an incoming trade from {from}.");
+        return true;
+    }
+
     private void DoOpenTrade()
     {
+        // Before the stale-dialog sweep below, not after. In combined mode the
+        // receiver's trade request arrives as exactly the kind of orphaned
+        // SelectYesno that block is designed to dismiss — check whether it's a
+        // request we want first, or we'd answer No to every handout.
+        if (TryAcceptMainTrade())
+        {
+            Goto(SweepState.WaitTradeOpen, TradeStepTimeout);
+            return;
+        }
+
         // A leftover "Trade these items?" dialog from a previous, interrupted trade
         // is modal and will block this one silently. Clear it before we do anything.
         if (!TradeEngine.IsTradeOpen && TradeEngine.HasStaleTradeDialog)
@@ -904,7 +948,7 @@ public class Sweeper
         if (thisTrade <= 0 && batch.Count == 0)
         {
             AddLog(CurrentName, "Nothing left to send.");
-            Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
+            DoneSending();
             return;
         }
 
@@ -941,6 +985,7 @@ public class Sweeper
 
         if (TradeEngine.UseTradeOn(cfg.MainFull))
         {
+            tradeRequestedAt = DateTime.Now;
             var what = thisTrade > 0 ? $"{thisTrade:N0} gil" : "";
             if (batch.Count > 0)
                 what += (what.Length > 0 ? " + " : "") + $"{batch.Count} item stack(s)";
@@ -953,10 +998,159 @@ public class Sweeper
     // being ready, so a flicker restarts the countdown.
     private DateTime settleStart = DateTime.MinValue;
 
+    // How long to wait for a request to turn into a trade window before deciding it
+    // was refused.
+    private const int TradeRequestGraceSeconds = 15;
+    private DateTime tradeRequestedAt = DateTime.MinValue;
+
     private void DoWaitTradeOpen()
     {
-        if (!TradeEngine.IsTradeOpen) return;
-        Goto(SweepState.EnterGil, cfg.TradeTimeout);
+        if (TradeEngine.IsTradeOpen)
+        {
+            tradeRequestedAt = DateTime.MinValue;
+            Goto(SweepState.EnterGil, cfg.TradeTimeout);
+            return;
+        }
+
+        // The receiver may be opening one at us instead.
+        if (TryAcceptMainTrade()) { tradeRequestedAt = DateTime.Now; return; }
+
+        // A request that never becomes a window was refused: the receiver was busy
+        // with someone else, or — in combined mode — turned us away on purpose
+        // because they've run out of stock to hand over.
+        //
+        // This timer deliberately ignores the patient-retry deadline suppression.
+        // Suppression exists so a run can WAIT on a busy receiver, but waiting in
+        // this particular state means waiting for a window that is never going to
+        // open, which is a hang rather than patience. Retrying is what's patient.
+        if (tradeRequestedAt == DateTime.MinValue) return;
+        if ((DateTime.Now - tradeRequestedAt).TotalSeconds < TradeRequestGraceSeconds) return;
+
+        tradeRequestedAt = DateTime.MinValue;
+        NoteTradeRefused();
+    }
+
+    // A refused request means exactly what a trade that moved nothing means, so it
+    // gets the same patience accounting — minus the gil and item bookkeeping, since
+    // no window ever existed to measure.
+    private void NoteTradeRefused()
+    {
+        tradeFailures++;
+        settleStart = DateTime.MinValue;
+
+        if (cfg.PatientRetry)
+        {
+            if (patientSince == DateTime.MinValue) patientSince = DateTime.Now;
+
+            var waited = DateTime.Now - patientSince;
+            var giveUp = cfg.PatientRetryMinutes > 0
+                         && waited >= TimeSpan.FromMinutes(cfg.PatientRetryMinutes);
+
+            if (giveUp)
+            {
+                if (cfg.RequeueOnBusy && Requeue()) return;
+                Fail($"Trade requests still being refused after {waited.TotalMinutes:F0} " +
+                     $"minutes ({tradeFailures} attempts). Giving up on this character.");
+                return;
+            }
+
+            var baseDelay = Math.Max(1, cfg.PatientRetryDelaySeconds);
+            var jitter = jitterRng.Next(0, Math.Max(1, baseDelay / 2));
+            patientWaitUntil = DateTime.Now.AddSeconds(baseDelay + jitter);
+
+            var tail = cfg.PatientRetryMinutes > 0
+                ? $"{(TimeSpan.FromMinutes(cfg.PatientRetryMinutes) - waited).TotalMinutes:F0}m left before giving up."
+                : "will keep trying until it goes through.";
+            AddLog(CurrentName,
+                $"Trade request wasn't accepted (attempt {tradeFailures}) — the receiver " +
+                $"is busy or out of stock. Retrying in {baseDelay + jitter}s. {tail}");
+        }
+        else
+        {
+            if (tradeFailures >= MaxTradeFailures)
+            {
+                Fail($"Trade request refused {tradeFailures}x in a row. The receiver is " +
+                     "busy, or dispensing and out of stock. Turn on \"Keep retrying while " +
+                     "the receiver is busy\" if you want this to wait instead.");
+                return;
+            }
+
+            AddLog(CurrentName,
+                $"Trade request wasn't accepted. Retrying {tradeFailures}/{MaxTradeFailures}.",
+                true);
+        }
+
+        Goto(SweepState.OpenTrade, TradeStepTimeout);
+    }
+
+    // Finished handing over. In combined mode, hang about in range for a moment
+    // instead of leaving immediately: the receiver may still be dispensing, and a
+    // handout too big for one window needs us here for the second.
+    private void DoneSending()
+    {
+        if (cfg.CombinedMode && cfg.DispenseWaitSeconds > 0)
+        {
+            dispenseUntil = DateTime.Now.AddSeconds(cfg.DispenseWaitSeconds);
+            dispenseCeiling = DateTime.Now.AddSeconds(cfg.DispenseWaitSeconds * 6 + 120);
+            AddLog(CurrentName,
+                $"Waiting up to {cfg.DispenseWaitSeconds}s for anything coming back.");
+            Goto(SweepState.WaitDispense, cfg.DispenseWaitSeconds + 180);
+            return;
+        }
+
+        Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
+    }
+
+    private DateTime dispenseUntil = DateTime.MinValue;
+
+    // Hard stop on the whole wait, however much activity keeps extending it. The
+    // rolling clock is what lets a multi-window handout finish, but on its own it
+    // means any trade window that never closes — a dry run, which deliberately
+    // never confirms, is the obvious one — would park this character permanently.
+    private DateTime dispenseCeiling = DateTime.MinValue;
+
+    // Receiving half of combined mode. We put nothing in — the receiver is the one
+    // handing over — so all this does is accept the request, confirm, and keep the
+    // clock topped up for as long as trades keep happening.
+    private void DoWaitDispense()
+    {
+        if (dispenseCeiling != DateTime.MinValue && DateTime.Now >= dispenseCeiling)
+        {
+            AddLog(CurrentName, "Giving up on the wait and heading home.", true);
+            TradeEngine.CancelTrade();
+            Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
+            return;
+        }
+
+        if (TradeEngine.IsTradeOpen)
+        {
+            ExtendDispenseWait();
+
+            // Confirming an offer we didn't add to is safe: a trade only completes
+            // once both sides have locked, and the receiver locks last. If they add
+            // another stack our lock clears, and we simply click again next tick.
+            if (TradeEngine.ConfirmTradeYesno(cfg.NoOp)) return;
+            TradeEngine.ConfirmTrade(cfg.NoOp);
+            return;
+        }
+
+        if (TryAcceptMainTrade())
+        {
+            ExtendDispenseWait();
+            return;
+        }
+
+        if (DateTime.Now >= dispenseUntil)
+            Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
+    }
+
+    // Push both clocks out together. The state deadline has to move with the wait,
+    // or a handout that legitimately takes several windows would trip the timeout
+    // and be reported as a failed character.
+    private void ExtendDispenseWait()
+    {
+        dispenseUntil = DateTime.Now.AddSeconds(Math.Max(10, cfg.DispenseWaitSeconds));
+        Goto(SweepState.WaitDispense, Math.Max(10, cfg.DispenseWaitSeconds) + 180);
     }
 
     private void DoEnterGil()
@@ -1084,7 +1278,7 @@ public class Sweeper
                 ? $"Done — {have:N0} gil left (floor {GilFloor:N0})."
                 : "Done.");
             gilToSend = 0;
-            Goto(SweepState.ReturnFc, cfg.FcReturnTimeout);
+            DoneSending();
             return;
         }
 
@@ -1452,6 +1646,9 @@ public class Sweeper
 
         Index++;
         wrongCharWarned = false;
+        dispenseUntil = DateTime.MinValue;
+        dispenseCeiling = DateTime.MinValue;
+        tradeRequestedAt = DateTime.MinValue;
         gilToSend = 0;
         thisTrade = 0;
         moveIssued = false;

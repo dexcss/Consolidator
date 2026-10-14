@@ -162,6 +162,167 @@ public static unsafe class TradeEngine
 
     public static bool IsTradeOpen => Svc.Condition[ConditionFlag.TradeOpen];
 
+    // ---------------- reading addons / identifying the other party ----------------
+
+    // Every non-empty string an addon is currently displaying.
+    //
+    // Walks the node tree rather than reaching for node IDs. Text living inside a
+    // component node (Type >= 1000) is invisible to GetNodeById, so those have to be
+    // recursed into explicitly or the interesting text is silently missed.
+    public static List<string> AddonText(string addonName)
+    {
+        var found = new List<string>();
+        try
+        {
+            if (!TryGetAddonByName<AtkUnitBase>(addonName, out var addon)) return found;
+            if (!IsAddonReady(addon)) return found;
+            HarvestText(&addon->UldManager, found, 0);
+        }
+        catch { /* node churn */ }
+        return found;
+    }
+
+    private static void HarvestText(AtkUldManager* uld, List<string> into, int depth)
+    {
+        if (uld == null || depth > 4) return;
+
+        for (var i = 0; i < uld->NodeListCount; i++)
+        {
+            var node = uld->NodeList[i];
+            if (node == null) continue;
+
+            // Component node: its children live in the component's own node list.
+            if ((ushort)node->Type >= 1000)
+            {
+                var comp = ((AtkComponentNode*)node)->Component;
+                if (comp != null) HarvestText(&comp->UldManager, into, depth + 1);
+                continue;
+            }
+
+            if (node->Type != NodeType.Text) continue;
+
+            var text = ((AtkTextNode*)node)->NodeText.ToString();
+            if (!string.IsNullOrWhiteSpace(text)) into.Add(text);
+        }
+    }
+
+    // Players other than us within range, as "Name@HomeWorld" plus the object.
+    // Self is excluded by address — our own name appears in the trade window too,
+    // and matching it would make us our own trade partner.
+    public static List<(string Full, IPlayerCharacter Pc)> NearbyPlayers(float maxDistance)
+    {
+        var list = new List<(string, IPlayerCharacter)>();
+        try
+        {
+            var me = Me;
+            if (me == null) return list;
+
+            foreach (var o in Svc.Objects)
+            {
+                if (o is not IPlayerCharacter pc) continue;
+                if (pc.Address == me.Address) continue;
+                if (Vector3.Distance(me.Position, pc.Position) > maxDistance) continue;
+
+                var w = pc.HomeWorld.ValueNullable;
+                var world = w == null ? "" : w.Value.Name.ToString();
+                var name = pc.Name.TextValue;
+                if (string.IsNullOrWhiteSpace(name)) continue;
+
+                list.Add((string.IsNullOrEmpty(world) ? name : $"{name}@{world}", pc));
+            }
+        }
+        catch { /* object table churn */ }
+        return list;
+    }
+
+    // Trade requests and the trade window only ever name the other player, never
+    // their world — so the name on its own cannot identify anybody on a roster that
+    // has the same name on two worlds. Resolve it through the object table instead:
+    // the person trading us has to be standing right there, so the nearby player
+    // whose name the addon is showing is the one, and they come with a home world
+    // attached.
+    //
+    // Returns "" when nobody matches OR when two nearby players share the matched
+    // name. Refusing to guess is the point: everything downstream of this hands over
+    // goods.
+    private static string MatchNamedPlayer(List<string> addonText, float maxDistance,
+                                           IReadOnlyCollection<string>? restrictTo = null)
+    {
+        if (addonText.Count == 0) return "";
+
+        var allowed = restrictTo == null
+            ? null
+            : new HashSet<string>(restrictTo, StringComparer.OrdinalIgnoreCase);
+
+        var hits = new List<string>();
+        foreach (var (full, pc) in NearbyPlayers(maxDistance))
+        {
+            if (allowed != null && !allowed.Contains(full)) continue;
+
+            var name = pc.Name.TextValue;
+            if (addonText.Any(t => t.Contains(name, StringComparison.OrdinalIgnoreCase)))
+                hits.Add(full);
+        }
+
+        var distinct = hits.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return distinct.Count == 1 ? distinct[0] : "";
+    }
+
+    // A trade request has to come from someone standing next to us, so matching is
+    // kept to a short radius — it keeps an unrelated dialog that happens to mention
+    // a roster name (a party invite from across the zone, say) from being mistaken
+    // for a trade request.
+    public const float PartnerRange = 15.0f;
+
+    // Who the open trade window is with, or "" if that can't be established.
+    public static string TradePartner(float maxDistance = PartnerRange)
+        => !IsTradeOpen ? "" : MatchNamedPlayer(AddonText("Trade"), maxDistance);
+
+    // An unanswered trade request from one of the given characters, or "".
+    //
+    // The request dialog is a plain SelectYesno, so the only thing distinguishing it
+    // from any other Yes/No prompt is that it names the requester. That's also what
+    // makes this language-independent: we look for a name we already know rather
+    // than for English prompt text.
+    public static string IncomingTradeRequest(IReadOnlyCollection<string> allowedFulls,
+                                              float maxDistance = PartnerRange)
+    {
+        if (IsTradeOpen) return "";
+        if (allowedFulls.Count == 0) return "";
+        return MatchNamedPlayer(AddonText("SelectYesno"), maxDistance, allowedFulls);
+    }
+
+    // Answer No to a trade request. Used when we have nothing to give and would
+    // rather the other side waited and tried again than spent their visit on a
+    // trade that does them no good.
+    public static bool DeclineTradeRequest()
+    {
+        try
+        {
+            if (!TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon)) return false;
+            if (!IsAddonReady(addon)) return false;
+            if (!EzThrottler.Throttle("Cons.DeclineTrade", 1000)) return false;
+
+            Callback.Fire(addon, true, 1);   // No
+            return true;
+        }
+        catch { return false; }
+    }
+
+    public static bool AcceptTradeRequest()
+    {
+        try
+        {
+            if (!TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon)) return false;
+            if (!IsAddonReady(addon)) return false;
+            if (!EzThrottler.Throttle("Cons.AcceptTrade", 1000)) return false;
+
+            Callback.Fire(addon, true, 0);   // Yes
+            return true;
+        }
+        catch { return false; }
+    }
+
     // Resolve a world name to its data centre and region. AR doesn't store either,
     // so we look them up in the game's own sheet: World -> DataCenter -> Region.
     // Cached, since this runs for every roster row.

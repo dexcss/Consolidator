@@ -24,6 +24,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Configuration Config { get; init; }
     public Sweeper Sweeper { get; init; }
+    public Dispenser Dispenser { get; init; }
     public ItemTradeHook ItemHook { get; init; }
 
     public readonly WindowSystem Windows = new("Consolidator");
@@ -56,12 +57,17 @@ public sealed class Plugin : IDalamudPlugin
 
         Sweeper = new Sweeper(Config);
 
+        // The giving half. It takes the sweeper so it can stand down while a sweep
+        // is running on this client — the two would otherwise fight over the same
+        // trade window.
+        Dispenser = new Dispenser(Config, Sweeper);
+
         MainWindow = new MainWindow(this);
         Windows.AddWindow(MainWindow);
 
         CommandManager.AddHandler(Command, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open Consolidator. /cons start | pause | resume | stop",
+            HelpMessage = "Open Consolidator. /cons start | pause | resume | stop | dispense",
         });
 
         PluginInterface.UiBuilder.Draw += Windows.Draw;
@@ -81,6 +87,16 @@ public sealed class Plugin : IDalamudPlugin
             try { Sweeper.Stop("Internal error — see /xllog."); }
             catch (Exception inner) { Log.Error(inner, "Stop() also failed."); }
         }
+
+        // Separate try: a fault in the dispenser must not take the sweep down with
+        // it, and vice versa. They run on different clients in normal use.
+        try { Dispenser.Tick(); }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Dispenser tick failed; stopping dispensing.");
+            try { Dispenser.Stop("Internal error — see /xllog."); }
+            catch (Exception inner) { Log.Error(inner, "Dispenser Stop() also failed."); }
+        }
     }
 
     private void OnCommand(string _, string args)
@@ -91,6 +107,8 @@ public sealed class Plugin : IDalamudPlugin
             case "stop": Sweeper.Stop(); break;
             case "pause": Sweeper.Pause(); break;
             case "resume": Sweeper.Resume(); break;
+            case "dispense": Dispenser.Start(); break;
+            case "dispense stop": Dispenser.Stop(); break;
             default: ToggleMain(); break;
         }
     }
@@ -101,6 +119,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         // Persist wherever we got to, so a reload or crash can be picked up.
         Sweeper.Stop("Plugin unloading.");
+        Dispenser.Stop("Plugin unloading.");
         Framework.Update -= OnUpdate;
         PluginInterface.UiBuilder.Draw -= Windows.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleMain;

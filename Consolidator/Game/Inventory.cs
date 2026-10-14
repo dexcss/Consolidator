@@ -111,6 +111,74 @@ public static unsafe class Inventory
         return total;
     }
 
+    // The dispensing counterpart to PlanFor: hand over a fixed quantity rather than
+    // "everything above a floor".
+    //
+    // Bags only, never the armoury — dispensing runs on the character holding the
+    // stock, and there is no scenario where handing out equipment from the armoury
+    // chest is what was meant.
+    //
+    // `reserve` is stock that must stay put no matter what, so a dispenser can't
+    // empty itself; `maxSlots` caps the plan to what one trade window will take.
+    public static List<TradeSlot> PlanGive(uint itemId, bool hq, string label,
+                                           long amount, long reserve, int maxSlots)
+    {
+        var plan = new List<TradeSlot>();
+        if (itemId == 0 || amount <= 0 || maxSlots <= 0) return plan;
+        if (!IsTradeable(itemId)) return plan;
+
+        try
+        {
+            var im = InventoryManager.Instance();
+            if (im == null) return plan;
+
+            var found = new List<TradeSlot>();
+
+            foreach (var bag in Bags)
+            {
+                var cont = im->GetInventoryContainer(bag);
+                if (cont == null) continue;
+
+                for (var i = 0; i < cont->Size; i++)
+                {
+                    var item = cont->Items[i];
+                    if (item.ItemId != itemId) continue;
+                    if (item.Quantity == 0) continue;
+                    if (item.Flags.HasFlag(InventoryItem.ItemFlags.HighQuality) != hq) continue;
+
+                    found.Add(new TradeSlot
+                    {
+                        Type = bag,
+                        Slot = (ushort)i,
+                        ItemId = itemId,
+                        Name = label,
+                        InStack = item.Quantity,
+                        Hq = hq,
+                    });
+                }
+            }
+
+            var have = found.Sum(x => x.InStack);
+            var want = Math.Min(amount, have - Math.Max(0, reserve));
+            if (want <= 0) return plan;
+
+            // Biggest stacks first: a trade window only holds five, so the fewer
+            // slots a given quantity costs, the more goes per pass.
+            foreach (var slot in found.OrderByDescending(x => x.InStack))
+            {
+                if (want <= 0 || plan.Count >= maxSlots) break;
+
+                var take = Math.Min(slot.InStack, want);
+                slot.Take = take;
+                want -= take;
+                plan.Add(slot);
+            }
+        }
+        catch { /* inventory churn */ }
+
+        return plan;
+    }
+
     // Work out exactly which slots to hand over for one configured item, honouring its
     // keep-amount. Returns them smallest-stack-first so we clear partial stacks before
     // breaking into full ones.

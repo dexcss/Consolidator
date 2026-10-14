@@ -53,6 +53,22 @@ public class DepositItem
     public bool IsGil => ItemId == 0;
 }
 
+// A fixed handout, given to each whitelisted character once per dispensing session.
+//
+// Deliberately NOT a DepositItem: that type expresses "trade everything above a
+// floor", which is the opposite question. Conflating the two would make KeepAmount
+// mean two different things depending on which list a row was sitting in.
+[Serializable]
+public class DispenseItem
+{
+    public uint ItemId;
+    public string Label = "";
+    public long Amount;          // how many each character receives
+    public long Reserve;         // stock that never leaves, however much is owed
+    public bool Hq;
+    public bool Enabled = true;
+}
+
 // A run that was interrupted (crash, force-quit, /xlplugins reload). Persisted so
 // we can offer to pick up where we left off instead of starting over.
 //
@@ -120,6 +136,70 @@ public class Configuration : IPluginConfiguration
     // Starts empty and stays that way until you add or import. Nothing is ever
     // auto-populated behind your back.
     public List<CharEntry> Characters = new();
+
+    // --- Dispensing (the other direction: the main hands things out) ---
+    //
+    // This runs on the client logged in as the receiving character, because only
+    // that side can put items into the trade window the alt opened. The roster above
+    // doubles as the whitelist: a character gets a handout if, and only if, they're
+    // on it and enabled.
+    public List<DispenseItem> DispenseItems = new();
+
+    // Accept incoming trade requests from whitelisted characters ourselves.
+    //
+    // Required for dispensing to work at all, and it means Dropbox has to be OFF on
+    // this character: Dropbox locks the trade the moment it opens, which is before
+    // there's anything in it from our side.
+    public bool DispenseAcceptRequests = true;
+
+    // Arm the dispenser automatically whenever this client is logged in as the
+    // receiving character. Stopping it by hand overrides this until the next
+    // character change.
+    public bool DispenseAutoStart;
+
+    // Halt handing out when the bags can't cover a whole handout, instead of
+    // part-serving whoever happens to be standing there.
+    //
+    // On by default because a character is far easier to reason about as either
+    // served or not served: the ledger then says exactly who still needs one, and a
+    // refill picks up precisely where it stopped. Off, the dispenser hands over
+    // whatever it has and the shortfall is spread across whoever turns up.
+    //
+    // Either way trades keep being accepted while out of stock — with Dropbox off
+    // this client is the only thing receiving the alts' gil, and refusing trades
+    // would stall every sweep feeding it.
+    public bool DispenseStopWhenOut = true;
+
+    // Carry on by itself once the stock is back, rather than waiting for the
+    // Continue button.
+    public bool DispenseAutoResume = true;
+
+    // While out of stock, turn trades away instead of completing them.
+    //
+    // This is what stops a combined run burning characters. The two clients can't
+    // talk to each other, so a declined trade is the only signal the sweeping side
+    // gets: nothing moves, which drops that alt into its patient-retry path and
+    // keeps it waiting at the receiver instead of handing over its gil and walking
+    // home unserved. Refill and the same visit finishes.
+    //
+    // Completing the trade instead would take their gil and send them away still
+    // owed, so after the refill that character has to be swept all over again.
+    public bool DispenseDeclineWhenOut = true;
+
+    // How long to keep trying to top a character up after a trade closes with some
+    // of their handout still outstanding. A trade window fits five stacks, so any
+    // amount larger than that needs a second window while they're still standing
+    // there.
+    public int DispenseFollowupSeconds = 30;
+
+    // --- Combined mode (sweep and dispense in the same visit) ---
+    //
+    // Set on the SWEEPING client, not the dispensing one. With it on, an alt that
+    // has finished handing over its gil waits at the receiver for anything coming
+    // back, and accepts trade requests from the receiver so a multi-window handout
+    // can finish before it walks home.
+    public bool CombinedMode;
+    public int DispenseWaitSeconds = 30;
 
     // Roster sort column. 0 = manual run order (the default, and the one the
     // sweep actually follows). Others are views only.
@@ -251,6 +331,18 @@ public class Configuration : IPluginConfiguration
             if (!seen.Add((it.ItemId, it.Hq)))
             {
                 Items.Remove(it);
+                changed = true;
+            }
+        }
+
+        // Same treatment for the dispense list. A gil row has no meaning here —
+        // the dispenser hands out items only — so drop one if it ever appears.
+        var seenGive = new HashSet<(uint, bool)>();
+        foreach (var it in DispenseItems.ToList())
+        {
+            if (it.ItemId == 0 || !seenGive.Add((it.ItemId, it.Hq)))
+            {
+                DispenseItems.Remove(it);
                 changed = true;
             }
         }

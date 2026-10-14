@@ -19,6 +19,7 @@ public class MainWindow : Window, IDisposable
     private readonly Plugin plugin;
     private Configuration Cfg => plugin.Config;
     private Sweeper Sweep => plugin.Sweeper;
+    private Dispenser Disp => plugin.Dispenser;
 
     private static readonly string Ver =
         System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(4) ?? "?";
@@ -50,6 +51,7 @@ public class MainWindow : Window, IDisposable
         DrawTab("Run", DrawRunTab);
         DrawTab("Characters", DrawCharactersTab);
         DrawTab("Send", DrawSendTab);
+        DrawTab("Dispenser", DrawDispenserTab);
         DrawTab("Settings", DrawSettingsTab);
         DrawTab("Log", DrawLogTab);
     }
@@ -100,6 +102,16 @@ public class MainWindow : Window, IDisposable
         {
             ImGui.SameLine();
             ImGui.TextColored(ImGuiColors.DalamudOrange, "  [DRY RUN]");
+        }
+
+        // Visible from whichever tab you're on, not just the Dispenser one.
+        if (Disp.NeedsRefill)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(ImGuiColors.DalamudRed,
+                Disp.TurningTradesAway
+                    ? "  CHARACTER OUT \u2014 REFILL (trades being turned away)"
+                    : "  CHARACTER OUT \u2014 REFILL");
         }
     }
 
@@ -1310,6 +1322,530 @@ public class MainWindow : Window, IDisposable
             {
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash))
                     remove = it;
+            }
+        }
+    }
+
+    // ---------------- dispenser ----------------
+
+    private string giveSearch = "";
+    private List<(uint Id, string Name)> giveHits = new();
+    private string refillMsg = "";
+
+    private void DrawDispenserTab()
+    {
+        DrawRefillBanner();
+
+        ImGui.Spacing();
+        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            "The other direction: the receiving character hands a fixed amount to every "
+            + "character on the Characters list that trades them. Run this on the client "
+            + "logged in as the receiver — only that side can put its own items into the "
+            + "trade window.");
+        ImGui.PopTextWrapPos();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        DrawDispenseStatus();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        DrawDispenseItems();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        DrawDispenseOptions();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        DrawDispenseProgress();
+    }
+
+    private void DrawRefillBanner()
+    {
+        if (!Disp.NeedsRefill)
+        {
+            refillMsg = "";
+            return;
+        }
+
+        ImGui.Spacing();
+        ImGui.TextColored(ImGuiColors.DalamudRed, "CHARACTER OUT \u2014 REFILL");
+
+        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ImGuiColors.DalamudOrange, Disp.RefillReason);
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            Disp.TurningTradesAway
+                ? "Trades are being turned away, so any alt waiting on one stays put "
+                  + "rather than handing over its gil and going home unserved. Refill "
+                  + "and the same visit finishes."
+                : "Nothing is being handed out until this is cleared. Trades are still "
+                  + "being accepted, so gil from your alts keeps landing in the meantime "
+                  + "\u2014 but they'll leave still owed, and need sweeping again later.");
+        ImGui.PopTextWrapPos();
+
+        ImGui.Spacing();
+        if (ImGui.Button("Refilled \u2014 continue")) refillMsg = Disp.ClearRefill();
+
+        ImGui.SameLine();
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            Cfg.DispenseAutoResume
+                ? "(or it picks up on its own once the stock is back)"
+                : "(auto-resume is off, so this button is the only way on)");
+
+        if (!string.IsNullOrEmpty(refillMsg))
+            ImGui.TextColored(ImGuiColors.DalamudRed, refillMsg);
+
+        ImGui.Spacing();
+        ImGui.Separator();
+    }
+
+    private void DrawDispenseStatus()
+    {
+        var onChar = Disp.OnDispensingCharacter;
+        var err = Disp.Validate();
+
+        using (ImRaii.Disabled(Disp.Running || err != null))
+        {
+            if (ImGui.Button("Start dispensing")) Disp.Start();
+        }
+
+        ImGui.SameLine();
+        using (ImRaii.Disabled(!Disp.Running))
+        {
+            if (ImGui.Button("Stop")) Disp.Stop();
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Reset ledger")) Disp.ResetLedger();
+        ImGuiComponents.HelpMarker(
+            "Forgets who has already been given their handout, so everyone is due one\n" +
+            "again. The ledger is per session — it isn't saved between game restarts.");
+
+        ImGui.Spacing();
+
+        if (err != null)
+        {
+            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+            ImGui.TextColored(ImGuiColors.DalamudOrange, err);
+            ImGui.PopTextWrapPos();
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(Cfg.MainFull))
+        {
+            ImGui.TextColored(ImGuiColors.DalamudOrange, "No receiving character set.");
+            return;
+        }
+
+        ImGui.TextUnformatted("Dispensing as:");
+        ImGui.SameLine();
+        ImGui.TextColored(ImGuiColors.DalamudViolet, Cfg.MainFull);
+
+        if (!onChar)
+        {
+            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+            ImGui.TextColored(ImGuiColors.DalamudOrange,
+                Player.Available
+                    ? $"You're on {TradeEngine.PlayerFull}, so nothing will be handed out here. "
+                      + "Dispensing only runs on the receiving character."
+                    : "Not logged in.");
+            ImGui.PopTextWrapPos();
+            return;
+        }
+
+        if (Sweep.Running)
+        {
+            ImGui.TextColored(ImGuiColors.DalamudOrange,
+                "A sweep is running on this client — dispensing stays out of the way.");
+            return;
+        }
+
+        if (!Disp.Running)
+        {
+            ImGui.TextColored(ImGuiColors.DalamudGrey, "Idle.");
+            return;
+        }
+
+        ImGui.TextColored(ImGuiColors.HealerGreen, $"Running — {Disp.State}.");
+        if (!string.IsNullOrEmpty(Disp.Partner))
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(ImGuiColors.DalamudGrey, $"With {Disp.Partner}.");
+        }
+    }
+
+    private void DrawDispenseItems()
+    {
+        if (!TradeEngine.ItemsAvailable)
+        {
+            ImGui.TextColored(ImGuiColors.DalamudRed, "Item trading is unavailable.");
+            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+            ImGui.TextColored(ImGuiColors.DalamudGrey,
+                (Plugin.P.ItemHook.Error ?? "The OfferItemTrade signature didn't resolve.")
+                + "\nDispensing needs it, so nothing can be handed out until it's fixed.");
+            ImGui.PopTextWrapPos();
+            return;
+        }
+
+        ImGui.TextColored(ImGuiColors.DalamudViolet, "Hand out");
+        ImGui.Spacing();
+
+        ImGui.SetNextItemWidth(240);
+        if (ImGui.InputTextWithHint("##givesearch", "Search for an item to hand out...",
+                                    ref giveSearch, 64))
+        {
+            giveHits = SearchItems(giveSearch);
+        }
+
+        if (giveHits.Count > 0)
+        {
+            using var box = ImRaii.Child("##givehits", new Vector2(-1, 110), true);
+            if (box)
+            {
+                foreach (var (id, name) in giveHits)
+                {
+                    if (ImGui.Selectable($"{name}##ghit{id}"))
+                    {
+                        if (id != 0 && !Cfg.DispenseItems.Any(x => x.ItemId == id))
+                        {
+                            Cfg.DispenseItems.Add(new DispenseItem
+                            {
+                                ItemId = id,
+                                Label = name,
+                                Amount = 0,
+                                Enabled = true,
+                            });
+                            Cfg.Save();
+                        }
+                        giveSearch = "";
+                        giveHits.Clear();
+                        break;
+                    }
+                }
+            }
+        }
+
+        ImGui.Spacing();
+
+        if (Cfg.DispenseItems.Count == 0)
+        {
+            ImGui.TextColored(ImGuiColors.DalamudGrey,
+                "Nothing to hand out yet. Search above to add an item.");
+            return;
+        }
+
+        DispenseItem? remove = null;
+
+        using (var table = ImRaii.Table("##giveitems", 7,
+            ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
+        {
+            if (table)
+            {
+                ImGui.TableSetupColumn("On", ImGuiTableColumnFlags.WidthFixed, 28);
+                ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn("HQ", ImGuiTableColumnFlags.WidthFixed, 32);
+                ImGui.TableSetupColumn("Give each", ImGuiTableColumnFlags.WidthFixed, 120);
+                ImGui.TableSetupColumn("Reserve", ImGuiTableColumnFlags.WidthFixed, 120);
+                ImGui.TableSetupColumn("In bags", ImGuiTableColumnFlags.WidthFixed, 110);
+                ImGui.TableSetupColumn("##grm", ImGuiTableColumnFlags.WidthFixed, 28);
+                ImGui.TableHeadersRow();
+
+                foreach (var it in Cfg.DispenseItems)
+                {
+                    ImGui.TableNextRow();
+
+                    ImGui.TableNextColumn();
+                    var on = it.Enabled;
+                    if (ImGui.Checkbox($"##gon{it.ItemId}", ref on)) { it.Enabled = on; Cfg.Save(); }
+
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(it.Label);
+
+                    ImGui.TableNextColumn();
+                    var hq = it.Hq;
+                    if (ImGui.Checkbox($"##ghq{it.ItemId}", ref hq)) { it.Hq = hq; Cfg.Save(); }
+
+                    ImGui.TableNextColumn();
+                    ImGui.SetNextItemWidth(-1);
+                    var amount = (int)it.Amount;
+                    if (ImGui.InputInt($"##ga{it.ItemId}", ref amount, 1, 100))
+                    {
+                        it.Amount = Math.Max(0, amount);
+                        Cfg.Save();
+                    }
+
+                    ImGui.TableNextColumn();
+                    ImGui.SetNextItemWidth(-1);
+                    var reserve = (int)it.Reserve;
+                    if (ImGui.InputInt($"##gr{it.ItemId}", ref reserve, 1, 100))
+                    {
+                        it.Reserve = Math.Max(0, reserve);
+                        Cfg.Save();
+                    }
+
+                    // Stock on whoever's logged in. Bags only, because that's all the
+                    // dispenser ever reaches into.
+                    ImGui.TableNextColumn();
+                    if (Player.Available)
+                    {
+                        var have = Inventory.CountOf(it.ItemId, it.Hq, false);
+                        var spendable = Math.Max(0, have - it.Reserve);
+
+                        if (have == 0)
+                            ImGui.TextColored(ImGuiColors.DalamudGrey, "—");
+                        else if (spendable > 0)
+                            ImGui.TextColored(ImGuiColors.HealerGreen, $"{spendable:N0}");
+                        else
+                            ImGui.TextColored(ImGuiColors.DalamudOrange, "0");
+
+                        if (ImGui.IsItemHovered())
+                        {
+                            var runs = it.Amount > 0 ? spendable / it.Amount : 0;
+                            ImGui.SetTooltip(
+                                $"{have:N0} in the bags, {it.Reserve:N0} reserved.\n" +
+                                $"Enough for {runs:N0} character(s) at {it.Amount:N0} each.");
+                        }
+                    }
+                    else
+                    {
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, "—");
+                    }
+
+                    ImGui.TableNextColumn();
+                    using (ImRaii.PushId($"grm{it.ItemId}"))
+                    {
+                        if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash))
+                            remove = it;
+                    }
+                }
+            }
+        }
+
+        if (remove != null)
+        {
+            Cfg.DispenseItems.Remove(remove);
+            Cfg.Save();
+        }
+
+        ImGui.Spacing();
+        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            "Each enabled character gets \"Give each\" of every enabled item, once. "
+            + "Reserve is stock that never leaves, however much is owed. "
+            + "A trade window holds five stacks, so a larger amount is handed over "
+            + "across several windows while they're still standing there.");
+        ImGui.PopTextWrapPos();
+    }
+
+    private void DrawDispenseOptions()
+    {
+        ImGui.TextColored(ImGuiColors.DalamudViolet, "How it runs");
+        ImGui.Spacing();
+
+        if (ImGui.Checkbox("Accept trade requests from the list", ref Cfg.DispenseAcceptRequests))
+            Cfg.Save();
+        ImGuiComponents.HelpMarker(
+            "Answers Yes to a trade request from a character on the Characters list who\n" +
+            "is standing next to you and still owed a handout. Nobody else is answered.\n\n" +
+            "Dropbox must be OFF on this character. Dropbox locks the trade the moment\n" +
+            "it opens, which is before there's anything in it from this side — the gil\n" +
+            "would still arrive, but the handout wouldn't go out.");
+
+        if (Cfg.DispenseAcceptRequests)
+        {
+            ImGui.Indent();
+            ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+            ImGui.TextColored(ImGuiColors.DalamudOrange,
+                "Turn Dropbox off on this character — Consolidator is handling the whole "
+                + "receiving side while this is on.");
+            ImGui.PopTextWrapPos();
+            ImGui.Unindent();
+        }
+
+        if (ImGui.Checkbox("Stop handing out when stock runs low", ref Cfg.DispenseStopWhenOut))
+            Cfg.Save();
+        ImGuiComponents.HelpMarker(
+            "When the bags can't cover a whole handout, stop giving and show a refill\n" +
+            "banner instead of part-serving whoever happens to be standing there.\n\n" +
+            "That keeps every character either fully served or untouched, so after a\n" +
+            "refill it carries on from exactly where it stopped.\n\n" +
+            "Off: hand over whatever is in the bags and let the shortfall fall where it\n" +
+            "may.");
+
+        if (Cfg.DispenseStopWhenOut)
+        {
+            ImGui.Indent();
+
+            if (ImGui.Checkbox("Turn trades away while out", ref Cfg.DispenseDeclineWhenOut))
+                Cfg.Save();
+            ImGuiComponents.HelpMarker(
+                "Say no to trades instead of completing them while out of stock.\n\n" +
+                "This is what stops a combined run burning through characters. The two\n" +
+                "clients can't talk to each other, so a declined trade is the only signal\n" +
+                "the sweeping side gets: nothing moves, so that alt falls into its\n" +
+                "patient-retry path and waits at the receiver instead of handing over its\n" +
+                "gil and walking home still owed. Refill, and the same visit finishes.\n\n" +
+                "Turn it OFF if you're dispensing on its own and would rather keep taking\n" +
+                "gil while you restock \u2014 but then anyone who turns up while you're out\n" +
+                "leaves unserved and has to be swept again.\n\n" +
+                "Works best with patient retry on and give-up set to 0 on the sweeping\n" +
+                "client, so a waiting alt doesn't time out before you've refilled.");
+
+            if (ImGui.Checkbox("Resume on its own once refilled", ref Cfg.DispenseAutoResume))
+                Cfg.Save();
+            ImGuiComponents.HelpMarker(
+                "Checks the bags about once a second and carries on as soon as there's\n" +
+                "enough again. Off, it waits for the Continue button.");
+
+            ImGui.Unindent();
+        }
+
+        if (ImGui.Checkbox("Start automatically on this character", ref Cfg.DispenseAutoStart))
+            Cfg.Save();
+        ImGuiComponents.HelpMarker(
+            "Arms the dispenser whenever you're logged in as the receiving character.\n" +
+            "Stopping it by hand overrides this until you change character.");
+
+        ImGui.SetNextItemWidth(160);
+        var follow = Cfg.DispenseFollowupSeconds;
+        if (ImGui.InputInt("Follow-up window (seconds)", ref follow, 5, 15))
+        {
+            Cfg.DispenseFollowupSeconds = Math.Clamp(follow, 0, 600);
+            Cfg.Save();
+        }
+        ImGuiComponents.HelpMarker(
+            "How long to keep opening fresh trades with someone who is still owed part\n" +
+            "of their handout. Only five stacks fit in one window, so anything larger\n" +
+            "needs this. 0 turns follow-ups off entirely.");
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.TextColored(ImGuiColors.DalamudViolet, "Combined mode (sweep + dispense)");
+        ImGui.Spacing();
+
+        ImGui.PushTextWrapPos(ImGui.GetContentRegionAvail().X);
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            "This half runs on the SWEEPING client, not this one. With it on, an alt that "
+            + "has finished handing over its gil waits at the receiver instead of leaving "
+            + "straight away, and accepts trades the receiver opens — so gil goes up and "
+            + "the handout comes down in the same visit.");
+        ImGui.PopTextWrapPos();
+
+        ImGui.Spacing();
+
+        if (ImGui.Checkbox("Collect a handout while sweeping", ref Cfg.CombinedMode))
+            Cfg.Save();
+        ImGuiComponents.HelpMarker(
+            "Set this in the Consolidator running your alts. It has no effect on the\n" +
+            "dispensing character itself.\n\n" +
+            "Off: a sweep hands over gil and goes home, exactly as before.");
+
+        if (Cfg.CombinedMode)
+        {
+            ImGui.Indent();
+            ImGui.SetNextItemWidth(160);
+            var wait = Cfg.DispenseWaitSeconds;
+            if (ImGui.InputInt("Wait at the receiver (seconds)", ref wait, 5, 15))
+            {
+                Cfg.DispenseWaitSeconds = Math.Clamp(wait, 0, 600);
+                Cfg.Save();
+            }
+            ImGuiComponents.HelpMarker(
+                "How long each alt lingers after sending, waiting for the handout. The\n" +
+                "clock restarts every time a trade happens, so a multi-window handout\n" +
+                "won't be cut off halfway. 0 disables the wait.");
+
+            if (Cfg.DispenseWaitSeconds <= 0)
+            {
+                ImGui.TextColored(ImGuiColors.DalamudOrange,
+                    "Set above 0, or alts will leave before anything can be handed to them.");
+            }
+            ImGui.Unindent();
+        }
+    }
+
+    private void DrawDispenseProgress()
+    {
+        ImGui.TextColored(ImGuiColors.DalamudViolet, "Who's had theirs");
+        ImGui.SameLine();
+
+        var enabled = Cfg.Characters.Where(c => c.Enabled).ToList();
+        ImGui.TextColored(ImGuiColors.DalamudGrey,
+            $"({Disp.ServedCount} of {enabled.Count} done)");
+
+        ImGui.Spacing();
+
+        if (enabled.Count == 0)
+        {
+            ImGui.TextColored(ImGuiColors.DalamudGrey,
+                "No characters enabled on the Characters tab — that list is the whitelist.");
+            return;
+        }
+
+        var live = Cfg.DispenseItems.Where(i => i.Enabled && i.ItemId != 0 && i.Amount > 0).ToList();
+
+        var reserved = ImGui.GetTextLineHeightWithSpacing() * 8;
+        var avail = Math.Max(100f, ImGui.GetContentRegionAvail().Y - reserved);
+
+        using (var table = ImRaii.Table("##givenlog", 3,
+            ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY,
+            new Vector2(-1, avail)))
+        {
+            if (table)
+            {
+                ImGui.TableSetupColumn("Character", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableSetupColumn("Given", ImGuiTableColumnFlags.WidthFixed, 160);
+                ImGui.TableSetupColumn("Still owed", ImGuiTableColumnFlags.WidthFixed, 110);
+                ImGui.TableSetupScrollFreeze(0, 1);
+                ImGui.TableHeadersRow();
+
+                foreach (var c in enabled)
+                {
+                    ImGui.TableNextRow();
+
+                    ImGui.TableNextColumn();
+                    ImGui.TextUnformatted(c.Full);
+
+                    ImGui.TableNextColumn();
+                    var parts = live.Select(i => $"{Disp.GivenTo(c.Full, i):N0} {i.Label}").ToList();
+                    ImGui.TextColored(ImGuiColors.DalamudGrey,
+                        parts.Count == 0 ? "—" : string.Join(", ", parts));
+
+                    ImGui.TableNextColumn();
+                    var owed = Disp.OwedTo(c.Full);
+                    if (live.Count == 0)
+                        ImGui.TextColored(ImGuiColors.DalamudGrey, "—");
+                    else if (owed == 0)
+                        ImGui.TextColored(ImGuiColors.HealerGreen, "done");
+                    else
+                        ImGui.TextColored(ImGuiColors.DalamudOrange, $"{owed:N0}");
+                }
+            }
+        }
+
+        ImGui.Spacing();
+        if (ImGui.SmallButton("Clear dispenser log")) Disp.Log.Clear();
+
+        using (var log = ImRaii.Child("##displog", new Vector2(-1, -1), true))
+        {
+            if (log)
+            {
+                foreach (var line in Disp.Log) DrawLogLine(line);
+
+                if (Disp.Running && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 40)
+                    ImGui.SetScrollHereY(1.0f);
             }
         }
     }
