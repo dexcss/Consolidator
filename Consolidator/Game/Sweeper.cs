@@ -159,6 +159,7 @@ public class Sweeper
         patientSince = DateTime.MinValue;
         patientWaitUntil = DateTime.MinValue;
         receiverLostAt = DateTime.MinValue;
+        lostSightAt = DateTime.MinValue;
         batch.Clear();
         batchPos = 0;
         itemsBefore = 0;
@@ -237,8 +238,9 @@ public class Sweeper
             // without a wait at the receiver every character would walk over and
             // turn straight round before anything could be handed to them.
             if (cfg.DispenseWaitSeconds <= 0)
-                return "Set \"Wait at the receiver\" above 0 on the Dispenser tab, "
-                     + "or characters will leave before they can be given anything.";
+                return "Set \"Wait at the receiver\" above 0 on the Run tab (under "
+                     + "\"Wait for a handout on every visit\"), or characters will leave "
+                     + "before they can be given anything.";
             return null;
         }
 
@@ -593,7 +595,11 @@ public class Sweeper
         // Skip on AR's cached figure before we even spend a login on them. The live
         // check after login still runs regardless — this is purely an optimisation
         // for characters we already have good reason to believe are empty.
-        if (cfg.SkipByCachedGil && ShouldSkipOnCachedGil(c, out var why))
+        //
+        // Never on a collection run: the point there is for every character to visit
+        // the receiver, and a cached gil figure says nothing about whether a handout
+        // is waiting for them.
+        if (!CollectRun && cfg.SkipByCachedGil && ShouldSkipOnCachedGil(c, out var why))
         {
             AddLog(c.Full, why);
             Goto(SweepState.NextCharacter, 10);
@@ -830,6 +836,7 @@ public class Sweeper
     }
 
     private bool moveIssued;
+    private DateTime lostSightAt = DateTime.MinValue;
 
     // Lifestream drops us at the aetheryte, which can be a long way from the
     // receiver. The object table sees her from far outside trade range, so we have
@@ -837,7 +844,18 @@ public class Sweeper
     private void DoApproach()
     {
         var target = TradeEngine.FindPlayer(cfg.MainFull);
-        if (target == null) { Fail("Lost sight of the receiving character."); return; }
+        if (target == null)
+        {
+            // A one-frame gap in the object table is normal (streaming, churn), so
+            // give it a few seconds before concluding they're actually gone — but
+            // don't let a genuinely absent receiver burn the whole approach budget.
+            if (lostSightAt == DateTime.MinValue) { lostSightAt = DateTime.Now; return; }
+            if ((DateTime.Now - lostSightAt).TotalSeconds < 5) return;
+
+            Fail("Lost sight of the receiving character.");
+            return;
+        }
+        lostSightAt = DateTime.MinValue;
 
         var dist = TradeEngine.DistanceTo(target);
 
@@ -1271,6 +1289,14 @@ public class Sweeper
     {
         if (!TradeEngine.IsTradeOpen) { Fail("Trade window closed unexpectedly."); return; }
 
+        // Defensive: an index out of range here would escape into Dalamud's
+        // framework update rather than merely failing a trade.
+        if (batchPos < 0 || batchPos >= batch.Count)
+        {
+            Goto(SweepState.ConfirmTrade, cfg.TradeTimeout);
+            return;
+        }
+
         var slot = batch[batchPos];
 
         if (TradeEngine.IsGilInputOpen)   // same InputNumeric addon as gil uses
@@ -1696,8 +1722,17 @@ public class Sweeper
             {
                 live.LastRunAt = DateTime.Now;
                 live.LastRunSent = charSent;
-                live.LastSeenGil = TradeEngine.GetCurrentGil();
-                live.LastSeenGilAt = DateTime.Now;
+
+                // Only record a gil figure when a character is actually loaded. For
+                // the final character with "log out at end" on, this state runs after
+                // the logout completes and the inventory is gone — GetCurrentGil()
+                // would then read 0 and stamp it as freshly seen, which makes
+                // SkipByCachedGil silently skip them on the next run.
+                if (Player.Available)
+                {
+                    live.LastSeenGil = TradeEngine.GetCurrentGil();
+                    live.LastSeenGilAt = DateTime.Now;
+                }
             }
 
             if (cfg.CrashProtection)
@@ -1729,6 +1764,7 @@ public class Sweeper
         settleStart = DateTime.MinValue;
         patientSince = DateTime.MinValue;
         patientWaitUntil = DateTime.MinValue;
+        lostSightAt = DateTime.MinValue;
 
         if (Index >= Queue.Count)
         {

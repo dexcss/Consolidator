@@ -55,16 +55,6 @@ public static unsafe class Inventory
     private static IEnumerable<InventoryType> Containers(bool includeArmoury)
         => includeArmoury ? Bags.Concat(Armoury) : Bags;
 
-    public static string ItemName(uint id)
-    {
-        try
-        {
-            var row = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Item>()?.GetRowOrDefault(id);
-            return row?.Name.ToString() ?? $"#{id}";
-        }
-        catch { return $"#{id}"; }
-    }
-
     // Untradeable items can't go into a trade window at all — attempting it just
     // wedges the state machine. Cached, since this is checked per slot per scan.
     private static readonly Dictionary<uint, bool> tradeableCache = new();

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Numerics;
 using System.Linq;
 using Dalamud.Plugin;
@@ -231,15 +232,31 @@ public static class PluginIpc
         catch { return "(unreadable)"; }
     }
 
-    public static bool IsAutoRetainerAvailable()
+    // ---- availability probes ----
+    //
+    // The UI asks "is this plugin there?" every frame (status dots, button
+    // enablement), and some of those IPC calls aren't free — GetRegisteredCIDs
+    // builds a whole list. The answer really only changes when a plugin is loaded
+    // or unloaded, so cache it briefly rather than re-asking sixty times a second.
+    private static readonly Dictionary<string, (DateTime At, bool Ok)> probeCache = new();
+
+    private static bool Probe(string key, Func<bool> probe, int maxAgeMs = 1000)
     {
-        try
-        {
-            Pi.GetIpcSubscriber<List<ulong>>("AutoRetainer.GetRegisteredCIDs").InvokeFunc();
-            return true;
-        }
-        catch { return false; }
+        if (probeCache.TryGetValue(key, out var hit)
+            && (DateTime.Now - hit.At).TotalMilliseconds < maxAgeMs)
+            return hit.Ok;
+
+        bool ok;
+        try { ok = probe(); } catch { ok = false; }
+        probeCache[key] = (DateTime.Now, ok);
+        return ok;
     }
+
+    public static bool IsAutoRetainerAvailable() => Probe("ar", () =>
+    {
+        Pi.GetIpcSubscriber<List<ulong>>("AutoRetainer.GetRegisteredCIDs").InvokeFunc();
+        return true;
+    });
 
     public static bool GetMultiModeEnabled()
     {
@@ -318,6 +335,13 @@ public static class PluginIpc
     // pathing when one exists and fall back to vnavmesh when it doesn't.
 
     // Returns the recorded PathToEntrance for this character's FC house, if any.
+    //
+    // The IPC returns a (Private, FC) tuple, and Dalamud hands a tuple of plugin
+    // types across the boundary as a Newtonsoft JObject ("Item1"/"Item2") — plain
+    // reflection for CLR fields finds nothing on a JObject, which is why this used
+    // to quietly come back empty every time. Both shapes are handled: JObject keys
+    // first, real reflection after (in case a future Dalamud passes it by
+    // reference instead of serialising it).
     public static List<Vector3> LifestreamGetFcEntrancePath(ulong cid)
     {
         try
@@ -325,24 +349,33 @@ public static class PluginIpc
             var res = Pi.GetIpcSubscriber<ulong, object>("Lifestream.GetHousePathData").InvokeFunc(cid);
             if (res == null) return new List<Vector3>();
 
-            // Returns a (Private, FC) tuple; we want Item2.
-            var fc = res.GetType().GetField("Item2")?.GetValue(res);
+            var fc = JGet(res, "Item2") ?? res.GetType().GetField("Item2")?.GetValue(res);
             if (fc == null) return new List<Vector3>();
 
-            var path = fc.GetType().GetField("PathToEntrance")?.GetValue(fc);
+            var path = JGet(fc, "PathToEntrance")
+                    ?? fc.GetType().GetField("PathToEntrance")?.GetValue(fc);
+            if (path == null) return new List<Vector3>();
+
             if (path is List<Vector3> list) return list;
 
-            // May come back as a JArray of JObjects if Dalamud serialized it.
+            // Serialised form: a JArray of { X, Y, Z } objects.
             if (path is System.Collections.IEnumerable e)
             {
                 var outp = new List<Vector3>();
                 foreach (var p in e)
                 {
                     var t = p.GetType();
-                    float F(string n) =>
-                        float.TryParse(
+                    float F(string n)
+                    {
+                        var tok = JGet(p, n);
+                        if (tok != null && float.TryParse(tok.ToString(), NumberStyles.Float,
+                                CultureInfo.InvariantCulture, out var jf))
+                            return jf;
+
+                        return float.TryParse(
                             (t.GetField(n)?.GetValue(p) ?? t.GetProperty(n)?.GetValue(p))?.ToString(),
-                            out var f) ? f : 0f;
+                            NumberStyles.Float, CultureInfo.InvariantCulture, out var f) ? f : 0f;
+                    }
                     outp.Add(new Vector3(F("X"), F("Y"), F("Z")));
                 }
                 return outp;
@@ -370,26 +403,11 @@ public static class PluginIpc
         }
     }
 
-    // Lifestream's own lookup for where a plot's entrance is.
-    public static Vector3? LifestreamGetPlotEntrance(uint territory, int plot)
+    public static bool IsLifestreamAvailable() => Probe("ls", () =>
     {
-        try
-        {
-            return Pi.GetIpcSubscriber<uint, int, Vector3?>("Lifestream.GetPlotEntrance")
-                     .InvokeFunc(territory, plot);
-        }
-        catch { return null; }
-    }
-
-    public static bool IsLifestreamAvailable()
-    {
-        try
-        {
-            Pi.GetIpcSubscriber<bool>("Lifestream.IsBusy").InvokeFunc();
-            return true;
-        }
-        catch { return false; }
-    }
+        Pi.GetIpcSubscriber<bool>("Lifestream.IsBusy").InvokeFunc();
+        return true;
+    });
 
     // ================= vnavmesh =================
     // Lifestream gets us to the aetheryte; it does not free-roam. Closing the last
@@ -430,15 +448,11 @@ public static class PluginIpc
         catch { /* ignore */ }
     }
 
-    public static bool IsVnavAvailable()
+    public static bool IsVnavAvailable() => Probe("nav", () =>
     {
-        try
-        {
-            Pi.GetIpcSubscriber<bool>("vnavmesh.Nav.IsReady").InvokeFunc();
-            return true;
-        }
-        catch { return false; }
-    }
+        Pi.GetIpcSubscriber<bool>("vnavmesh.Nav.IsReady").InvokeFunc();
+        return true;
+    });
 
     // ================= reflection helpers =================
 

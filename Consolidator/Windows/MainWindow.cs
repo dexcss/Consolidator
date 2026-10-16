@@ -94,6 +94,11 @@ public class MainWindow : Window, IDisposable
                 (Sweep.CollectRun ? "  Collecting \u2014 " : "  ")
                 + $"{Sweep.State}  ({Sweep.Index + 1}/{Sweep.Queue.Count})");
         }
+        else if (Disp.Running)
+        {
+            ImGui.TextColored(ImGuiColors.HealerGreen,
+                $"  Dispensing — {Disp.State}");
+        }
         else
         {
             ImGui.TextColored(ImGuiColors.DalamudGrey, "  Idle");
@@ -954,6 +959,7 @@ public class MainWindow : Window, IDisposable
     // without Consolidator ever having visited the character.
     private string RefreshFromAr()
     {
+        PluginIpc.LastError = "";
         var updated = 0;
 
         foreach (var c in Cfg.Characters)
@@ -1231,20 +1237,22 @@ public class MainWindow : Window, IDisposable
         ImGui.Spacing();
         if (ImGui.TreeNode("Timeouts (seconds)"))
         {
+            // Values are clamped at entry — a negative or zero timeout would fail
+            // every step the moment it started.
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Login", ref Cfg.LoginTimeout)) Cfg.Save();
+            if (ImGui.InputInt("Login", ref Cfg.LoginTimeout)) { Cfg.LoginTimeout = Math.Max(10, Cfg.LoginTimeout); Cfg.Save(); }
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Travel", ref Cfg.TravelTimeout)) Cfg.Save();
+            if (ImGui.InputInt("Travel", ref Cfg.TravelTimeout)) { Cfg.TravelTimeout = Math.Max(10, Cfg.TravelTimeout); Cfg.Save(); }
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Find receiver", ref Cfg.LocateMainTimeout)) Cfg.Save();
+            if (ImGui.InputInt("Find receiver", ref Cfg.LocateMainTimeout)) { Cfg.LocateMainTimeout = Math.Max(5, Cfg.LocateMainTimeout); Cfg.Save(); }
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Walk to receiver", ref Cfg.ApproachTimeout)) Cfg.Save();
+            if (ImGui.InputInt("Walk to receiver", ref Cfg.ApproachTimeout)) { Cfg.ApproachTimeout = Math.Max(10, Cfg.ApproachTimeout); Cfg.Save(); }
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Trade", ref Cfg.TradeTimeout)) Cfg.Save();
+            if (ImGui.InputInt("Trade", ref Cfg.TradeTimeout)) { Cfg.TradeTimeout = Math.Max(10, Cfg.TradeTimeout); Cfg.Save(); }
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("FC return", ref Cfg.FcReturnTimeout)) Cfg.Save();
+            if (ImGui.InputInt("FC return", ref Cfg.FcReturnTimeout)) { Cfg.FcReturnTimeout = Math.Max(10, Cfg.FcReturnTimeout); Cfg.Save(); }
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Enter house", ref Cfg.EnterHouseTimeout)) Cfg.Save();
+            if (ImGui.InputInt("Enter house", ref Cfg.EnterHouseTimeout)) { Cfg.EnterHouseTimeout = Math.Max(10, Cfg.EnterHouseTimeout); Cfg.Save(); }
             ImGui.TreePop();
         }
 
@@ -1252,13 +1260,13 @@ public class MainWindow : Window, IDisposable
         if (ImGui.TreeNode("Settle delays (ms)"))
         {
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("After arriving", ref Cfg.ArrivalSettleMs, 250, 1000)) Cfg.Save();
+            if (ImGui.InputInt("After arriving", ref Cfg.ArrivalSettleMs, 250, 1000)) { Cfg.ArrivalSettleMs = Math.Max(0, Cfg.ArrivalSettleMs); Cfg.Save(); }
             ImGuiComponents.HelpMarker(
                 "Wait this long after a teleport before looking for the receiver.\n" +
                 "Objects stream in over several frames after a zone change.");
 
             ImGui.SetNextItemWidth(120);
-            if (ImGui.InputInt("Before trading", ref Cfg.TradeSettleMs, 250, 1000)) Cfg.Save();
+            if (ImGui.InputInt("Before trading", ref Cfg.TradeSettleMs, 250, 1000)) { Cfg.TradeSettleMs = Math.Max(0, Cfg.TradeSettleMs); Cfg.Save(); }
             ImGuiComponents.HelpMarker(
                 "The receiver must be continuously loaded, rendered and in range for\n" +
                 "this long before /trade fires. Raise this if the first trade of a\n" +
@@ -1306,8 +1314,11 @@ public class MainWindow : Window, IDisposable
                 {
                     if (ImGui.Selectable($"{name}##hit{id}"))
                     {
-                        // id 0 is gil, which already has its own row above.
-                        if (id != 0 && !Cfg.Items.Any(x => x.ItemId == id))
+                        // id 0 is gil, which already has its own row above. A second
+                        // quality of the same item is a legitimate addition (NQ row +
+                        // HQ row, each with its own keep amount), so only the default
+                        // NQ row is treated as a duplicate.
+                        if (id != 0 && !Cfg.Items.Any(x => x.ItemId == id && !x.Hq))
                         {
                             Cfg.Items.Add(new DepositItem
                             {
@@ -1472,25 +1483,32 @@ public class MainWindow : Window, IDisposable
 
     private void DrawItemRows(List<DepositItem> items, ref DepositItem? remove)
     {
-        foreach (var it in items)
+        for (var idx = 0; idx < items.Count; idx++)
         {
+            var it = items[idx];
+
+            // Widget IDs keyed by row position (plus the item id for readability).
+            // The same item can legitimately sit on the list twice with different
+            // qualities, and item-id-only keys would collide across both rows.
+            var key = $"{idx}_{it.ItemId}";
+
             ImGui.TableNextRow();
 
             ImGui.TableNextColumn();
             var on = it.Enabled;
-            if (ImGui.Checkbox($"##ion{it.ItemId}", ref on)) { it.Enabled = on; Cfg.Save(); }
+            if (ImGui.Checkbox($"##ion{key}", ref on)) { it.Enabled = on; Cfg.Save(); }
 
             ImGui.TableNextColumn();
             ImGui.TextUnformatted(it.Label);
 
             ImGui.TableNextColumn();
             var hq = it.Hq;
-            if (ImGui.Checkbox($"##ihq{it.ItemId}", ref hq)) { it.Hq = hq; Cfg.Save(); }
+            if (ImGui.Checkbox($"##ihq{key}", ref hq)) { it.Hq = hq; Cfg.Save(); }
 
             ImGui.TableNextColumn();
             ImGui.SetNextItemWidth(-1);
             var keep = (int)it.KeepAmount;
-            if (ImGui.InputInt($"##ik{it.ItemId}", ref keep, 1, 10))
+            if (ImGui.InputInt($"##ik{key}", ref keep, 1, 10))
             {
                 it.KeepAmount = Math.Max(0, keep);
                 Cfg.Save();
@@ -1520,7 +1538,7 @@ public class MainWindow : Window, IDisposable
             }
 
             ImGui.TableNextColumn();
-            using (ImRaii.PushId($"irm{it.ItemId}"))
+            using (ImRaii.PushId($"irm{key}"))
             {
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash))
                     remove = it;
@@ -1708,7 +1726,9 @@ public class MainWindow : Window, IDisposable
                 {
                     if (ImGui.Selectable($"{name}##ghit{id}"))
                     {
-                        if (id != 0 && !Cfg.DispenseItems.Any(x => x.ItemId == id))
+                        // Same rule as the Give away list: the NQ row is the duplicate
+                        // to block, an HQ companion row is fine.
+                        if (id != 0 && !Cfg.DispenseItems.Any(x => x.ItemId == id && !x.Hq))
                         {
                             Cfg.DispenseItems.Add(new DispenseItem
                             {
@@ -1753,20 +1773,26 @@ public class MainWindow : Window, IDisposable
                 ImGui.TableSetupColumn("##grm", ImGuiTableColumnFlags.WidthFixed, 28);
                 ImGui.TableHeadersRow();
 
-                foreach (var it in Cfg.DispenseItems)
+                for (var idx = 0; idx < Cfg.DispenseItems.Count; idx++)
                 {
+                    var it = Cfg.DispenseItems[idx];
+
+                    // Position-keyed widget IDs: the same item may sit on the list
+                    // twice (NQ + HQ), so item-id-only keys would collide.
+                    var key = $"{idx}_{it.ItemId}";
+
                     ImGui.TableNextRow();
 
                     ImGui.TableNextColumn();
                     var on = it.Enabled;
-                    if (ImGui.Checkbox($"##gon{it.ItemId}", ref on)) { it.Enabled = on; Cfg.Save(); }
+                    if (ImGui.Checkbox($"##gon{key}", ref on)) { it.Enabled = on; Cfg.Save(); }
 
                     ImGui.TableNextColumn();
                     ImGui.TextUnformatted(it.Label);
 
                     ImGui.TableNextColumn();
                     var hq = it.Hq;
-                    if (ImGui.Checkbox($"##ghq{it.ItemId}", ref hq)) { it.Hq = hq; Cfg.Save(); }
+                    if (ImGui.Checkbox($"##ghq{key}", ref hq)) { it.Hq = hq; Cfg.Save(); }
 
                     // Top-up needs a readable count of what the other character is
                     // already holding, and the only source for that is AutoRetainer's
@@ -1779,7 +1805,7 @@ public class MainWindow : Window, IDisposable
                     if (trackable)
                     {
                         var top = it.TopUp;
-                        if (ImGui.Checkbox($"##gtu{it.ItemId}", ref top))
+                        if (ImGui.Checkbox($"##gtu{key}", ref top))
                         {
                             it.TopUp = top;
                             Cfg.Save();
@@ -1806,7 +1832,7 @@ public class MainWindow : Window, IDisposable
                     ImGui.TableNextColumn();
                     ImGui.SetNextItemWidth(-1);
                     var amount = (int)it.Amount;
-                    if (ImGui.InputInt($"##ga{it.ItemId}", ref amount, 1, 100))
+                    if (ImGui.InputInt($"##ga{key}", ref amount, 1, 100))
                     {
                         it.Amount = Math.Max(0, amount);
                         Cfg.Save();
@@ -1819,7 +1845,7 @@ public class MainWindow : Window, IDisposable
                     ImGui.TableNextColumn();
                     ImGui.SetNextItemWidth(-1);
                     var reserve = (int)it.Reserve;
-                    if (ImGui.InputInt($"##gr{it.ItemId}", ref reserve, 1, 100))
+                    if (ImGui.InputInt($"##gr{key}", ref reserve, 1, 100))
                     {
                         it.Reserve = Math.Max(0, reserve);
                         Cfg.Save();
@@ -1854,7 +1880,7 @@ public class MainWindow : Window, IDisposable
                     }
 
                     ImGui.TableNextColumn();
-                    using (ImRaii.PushId($"grm{it.ItemId}"))
+                    using (ImRaii.PushId($"grm{key}"))
                     {
                         if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash))
                             remove = it;

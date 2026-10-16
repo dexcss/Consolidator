@@ -50,11 +50,19 @@ public unsafe class ItemTradeHook
     private void OfferItemTradeDetour(nint tradeAddress, ushort slot, InventoryType type)
         => throw new NotImplementedException();   // never called; hook stays disabled
 
-    public static InventoryItem GetSlot(InventoryType type, int slot)
+    // Null/bounds-safe slot read. Unsafe reads on a bad pointer cannot be caught as
+    // exceptions on .NET — an access violation takes the whole client down — so
+    // these checks are hard guards, not try/catch material.
+    private static bool TryGetSlot(InventoryType type, int slot, out InventoryItem item)
     {
+        item = default;
         var im = InventoryManager.Instance();
+        if (im == null) return false;
         var cont = im->GetInventoryContainer(type);
-        return cont->Items[slot];
+        if (cont == null) return false;
+        if (slot < 0 || slot >= cont->Size) return false;
+        item = cont->Items[slot];
+        return true;
     }
 
     // Offer the item in the given inventory slot into the open trade window.
@@ -66,13 +74,23 @@ public unsafe class ItemTradeHook
 
         try
         {
-            if (GetSlot(type, slot).ItemId == 0)
+            if (!TryGetSlot(type, slot, out var item))
+            {
+                Plugin.Log.Warning($"Refusing to trade an unreadable slot ({type}, {slot}).");
+                return false;
+            }
+
+            if (item.ItemId == 0)
             {
                 Plugin.Log.Warning($"Refusing to trade an empty slot ({type}, {slot}).");
                 return false;
             }
 
-            var agent = (nint)UIModule.Instance()->GetAgentModule()->GetAgentByInternalId(AgentId.Trade);
+            var module = UIModule.Instance();
+            if (module == null) return false;
+            var agentModule = module->GetAgentModule();
+            if (agentModule == null) return false;
+            var agent = (nint)agentModule->GetAgentByInternalId(AgentId.Trade);
             if (agent == 0) return false;
 
             OfferItemTradeHook.Delegate(agent + 40, slot, type);

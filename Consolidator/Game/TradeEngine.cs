@@ -480,7 +480,13 @@ public static unsafe class TradeEngine
         if (!TryGetAddonByName<AtkUnitBase>("Trade", out var addon) || !IsAddonReady(addon))
             return false;
 
-        var btn = (AtkComponentButton*)addon->UldManager.NodeList[3]->GetComponent();
+        // A null node or a short list here would be an uncatchable access violation
+        // rather than a caught exception, so guard the read explicitly.
+        if (addon->UldManager.NodeListCount <= 3) return false;
+        var node = addon->UldManager.NodeList[3];
+        if (node == null) return false;
+
+        var btn = (AtkComponentButton*)node->GetComponent();
         if (btn == null || !btn->IsEnabled) return false;
 
         if (!EzThrottler.Throttle("Cons.Confirm", 1000)) return false;
@@ -509,7 +515,14 @@ public static unsafe class TradeEngine
         {
             if (!EzThrottler.Throttle("Cons.DismissStale", 500)) return;
             if (TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon) && IsAddonReady(addon))
+            {
+                // The stale dialog this exists for is the leftover trade confirmation,
+                // so only answer when it looks like one (or can't be read). Answering
+                // No to an unrelated dialog here could dismiss something the user is
+                // in the middle of.
+                if (!IsTradeConfirmDialog()) return;
                 Callback.Fire(addon, true, 1);   // No
+            }
         }
         catch { /* ignore */ }
     }
@@ -524,7 +537,12 @@ public static unsafe class TradeEngine
         try
         {
             if (TryGetAddonByName<AtkUnitBase>("SelectYesno", out var yn) && IsAddonReady(yn))
-                Callback.Fire(yn, true, 1);   // No — back out of the confirmation
+            {
+                // Only back out of the trade confirmation; an unrelated dialog is
+                // left alone (it'll be the user's, or handled by its own state).
+                if (IsTradeConfirmDialog())
+                    Callback.Fire(yn, true, 1);   // No — back out of the confirmation
+            }
         }
         catch { /* ignore */ }
 
@@ -555,15 +573,50 @@ public static unsafe class TradeEngine
 
     // ---------------- housing entrance ----------------
 
-    // The estate entrance is a targetable object; Lifestream matches it by name,
-    // so we do the same. Covers the client languages it supports.
-    private static readonly string[] EntranceNames =
+    // The estate entrance is a targetable object. Lifestream matches it by name and
+    // reads those names from the game's own EObjName sheet (rows 2002737/2002739),
+    // which covers every client language automatically. We resolve the names the
+    // same way and keep the old hardcoded list as a fallback if the sheet can't be
+    // read for any reason.
+    private static readonly string[] EntranceNamesFallback =
     {
         "Entrance", "Eingang", "Entrée",
         "ハウスへ入る", "进入房屋", "進入房屋", "주택으로 들어가기",
     };
 
-    private static readonly string[] ConfirmEntranceText =
+    private static string[]? entranceNames;
+
+    private static string[] EntranceNames
+    {
+        get
+        {
+            if (entranceNames == null)
+            {
+                var names = new List<string>();
+                try
+                {
+                    var sheet = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.EObjName>();
+                    if (sheet != null)
+                    {
+                        foreach (var rowId in new[] { 2002737u, 2002739u })
+                        {
+                            var name = sheet.GetRow(rowId).Singular.GetText();
+                            if (!string.IsNullOrWhiteSpace(name)) names.Add(name);
+                        }
+                    }
+                }
+                catch { /* sheet miss — the fallback list below still applies */ }
+
+                names.AddRange(EntranceNamesFallback);
+                entranceNames = names.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            }
+            return entranceNames;
+        }
+    }
+
+    // The "Enter the estate hall?" prompt. Lifestream reads it from the game's Warp
+    // sheet (row 131148), so we do the same; the old hardcoded list is the fallback.
+    private static readonly string[] ConfirmEntranceFallback =
     {
         "Enter the estate hall?",
         "Das Gebäude betreten?",
@@ -573,6 +626,35 @@ public static unsafe class TradeEngine
         "要進入這間房屋嗎？",
         "'주택'으로 들어가시겠습니까?",
     };
+
+    private static string[]? confirmEntranceTexts;
+
+    private static string[] ConfirmEntranceTexts
+    {
+        get
+        {
+            if (confirmEntranceTexts == null)
+            {
+                var texts = new List<string>();
+                try
+                {
+                    var q = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Warp>()
+                        ?.GetRow(131148).Question.GetText();
+                    if (!string.IsNullOrWhiteSpace(q)) texts.Add(q);
+                }
+                catch { /* sheet miss — the fallback list below still applies */ }
+
+                texts.AddRange(ConfirmEntranceFallback);
+                confirmEntranceTexts = texts.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            }
+            return confirmEntranceTexts;
+        }
+    }
+
+    // True when any of the strings an addon is showing contains one of `expected`.
+    private static bool DialogMatches(IReadOnlyCollection<string> harvested, string[] expected)
+        => harvested.Any(t => expected.Any(e =>
+               t.Contains(e, StringComparison.OrdinalIgnoreCase)));
 
     public static IGameObject? FindEntrance(out float distance)
     {
@@ -627,19 +709,73 @@ public static unsafe class TradeEngine
     }
 
     // The "Enter the estate hall?" prompt. Matched by text so we don't click an
-    // unrelated Yes/No that happens to be open.
+    // unrelated Yes/No that happens to be open. If no dialog text can be harvested
+    // at all, fall back to answering — being unable to read the prompt must not
+    // block the entrance forever.
     public static bool ConfirmEntranceYesno()
     {
         try
         {
             if (!TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon)) return false;
             if (!IsAddonReady(addon)) return false;
+
+            var harvested = AddonText("SelectYesno");
+            if (harvested.Count > 0 && !DialogMatches(harvested, ConfirmEntranceTexts))
+                return false;
+
             if (!EzThrottler.Throttle("Cons.EntranceYes", 1000)) return false;
 
             Callback.Fire(addon, true, 0);
             return true;
         }
         catch { return false; }
+    }
+
+    // The game's own text for the "Trade these items?" prompt (Addon sheet row 102223),
+    // in whatever language the client runs in. Dropbox matches the same row. We use it
+    // so the dialog we answer is the actual trade confirmation and not something else
+    // that happens to be on screen while a trade is mid-confirm.
+    //
+    // Resolved lazily and cached. If it can't be read, the callers fall back to the
+    // old behaviour (answer whatever dialog is up) rather than refusing to confirm —
+    // a stalled trade is worse than a stubborn one, and the fallback is logged.
+    private static string? tradeConfirmPrompt;
+    private static bool warnedNoTradePrompt;
+
+    private static string TradeConfirmPrompt
+    {
+        get
+        {
+            if (tradeConfirmPrompt == null)
+            {
+                try
+                {
+                    tradeConfirmPrompt = Svc.Data.GetExcelSheet<Lumina.Excel.Sheets.Addon>()
+                        ?.GetRow(102223).Text.GetText() ?? "";
+                }
+                catch { tradeConfirmPrompt = ""; }
+            }
+            return tradeConfirmPrompt;
+        }
+    }
+
+    // Is the open SelectYesno the trade-confirmation prompt (or unreadable)?
+    // Unreadable counts as "yes, go ahead" — see TradeConfirmPrompt.
+    private static bool IsTradeConfirmDialog()
+    {
+        var prompt = TradeConfirmPrompt;
+        var harvested = AddonText("SelectYesno");
+        if (harvested.Count == 0) return true;             // nothing readable — answer it
+
+        if (prompt.Length > 0) return DialogMatches(harvested, new[] { prompt });
+
+        if (!warnedNoTradePrompt)
+        {
+            warnedNoTradePrompt = true;
+            Plugin.Log.Warning("[Consolidator] Couldn't resolve the trade-confirm prompt text; " +
+                               "answering any dialog that appears during a trade.");
+        }
+        return true;                                       // prompt unknown — answer it
     }
 
     // The "Trade these items?" confirmation the sender gets after locking the trade.
@@ -651,6 +787,12 @@ public static unsafe class TradeEngine
         {
             if (!TryGetAddonByName<AtkUnitBase>("SelectYesno", out var addon)) return false;
             if (!IsAddonReady(addon)) return false;
+
+            // Only answer the actual trade prompt. The confirm state can sit here for
+            // as long as the window stays open, so any unrelated dialog that appears
+            // in the meantime must be left alone.
+            if (!IsTradeConfirmDialog()) return false;
+
             if (!EzThrottler.Throttle("Cons.TradeYes", 1000)) return false;
 
             if (noOp)

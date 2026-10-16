@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Configuration;
+using Newtonsoft.Json;
 
 namespace Consolidator;
 
@@ -36,6 +37,9 @@ public class CharEntry
     // "Order"; the other sorts are views and don't disturb this.
     public int Order;
 
+    // Computed — never serialised. Newtonsoft emits get-only properties, so without
+    // this every config save would write a redundant Full into the JSON.
+    [JsonIgnore]
     public string Full => string.IsNullOrWhiteSpace(World) ? Name : $"{Name}@{World}";
 }
 
@@ -50,6 +54,7 @@ public class DepositItem
     public bool Enabled = true;
     public bool Hq;              // v2 (items); ignored for gil
 
+    [JsonIgnore]
     public bool IsGil => ItemId == 0;
 }
 
@@ -132,6 +137,9 @@ public class Configuration : IPluginConfiguration
     // Must match the Sender format AR/Dropbox use: "First Last@World".
     public string MainName = "";
     public string MainWorld = "";
+
+    // Computed — see CharEntry.Full. Keep it out of the saved JSON.
+    [JsonIgnore]
     public string MainFull => string.IsNullOrWhiteSpace(MainWorld)
         ? MainName
         : $"{MainName}@{MainWorld}";

@@ -3,7 +3,7 @@
     <PropertyGroup>
         <Authors>Akari</Authors>
         <AssemblyName>Consolidator</AssemblyName>
-        <Version>1.7.0.0</Version>
+        <Version>1.8.0.0</Version>
         <Description>Automatically consolidates gil from your submarine alts onto a single character via trade.</Description>
     </PropertyGroup>
 
